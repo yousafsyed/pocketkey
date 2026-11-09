@@ -54,6 +54,7 @@ pub fn inspect(cbor: &[u8]) -> Probe {
         _ => true,
     };
     if up_requested {
+        describe_request(&entries, &|k| field(k));
         return Probe::NotSilent;
     }
 
@@ -99,6 +100,61 @@ pub fn inspect(cbor: &[u8]) -> Probe {
         })
         .collect();
     Probe::Assertions(responses)
+}
+
+/// Debug-log the shape of a request we are about to forward: enough to see
+/// what a phone might object to, without the clientDataHash or credential ids.
+fn describe_request<'a>(entries: &'a [(Value, Value)], field: &dyn Fn(i64) -> Option<&'a Value>) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let rp_id = field(0x01).and_then(|v| v.as_text()).unwrap_or("?");
+    let allow: Vec<usize> = match field(0x03) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|c| match c {
+                Value::Map(f) => f
+                    .iter()
+                    .find(|(k, _)| k.as_text() == Some("id"))
+                    .and_then(|(_, v)| v.as_bytes())
+                    .map_or(0, |b| b.len()),
+                _ => 0,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let transports: Vec<String> = match field(0x03) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|c| match c {
+                Value::Map(f) => f
+                    .iter()
+                    .find(|(k, _)| k.as_text() == Some("transports"))
+                    .map(|(_, v)| format!("{v:?}")),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let extensions: Vec<String> = match field(0x04) {
+        Some(Value::Map(f)) => f
+            .iter()
+            .filter_map(|(k, _)| k.as_text().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let options = field(0x05).map(|v| format!("{v:?}")).unwrap_or_default();
+    let keys: Vec<String> = entries.iter().map(|(k, _)| format!("{k:?}")).collect();
+    tracing::debug!(
+        rp_id,
+        allow_list_id_lengths = ?allow,
+        allow_list_transports = ?transports,
+        ?extensions,
+        %options,
+        has_pin_uv_auth = field(0x06).is_some(),
+        ?keys,
+        "getAssertion request to forward"
+    );
 }
 
 /// `rpIdHash || flags || signCount` with no flags set and a zero counter.
