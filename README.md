@@ -58,8 +58,9 @@ Firefox ──hidraw──▶ /dev/uhid ──▶ pocketkey ──BLE + wss tunn
   vendor IDs, so a snap Firefox never sees pocketkey's device. See
   [Mozilla's instructions](https://support.mozilla.org/kb/install-firefox-linux#w_install-firefox-deb-package-for-debian-based-distributions)
   for switching.
-- An Android phone with passkeys in Google Password Manager (tested), or an
-  iPhone with iCloud Keychain (should work, untested).
+- An Android phone with passkeys in Google Password Manager, or an iPhone
+  with iCloud Keychain. Both are tested with Firefox and Chrome for
+  registration and sign-in.
 
 ## Install
 

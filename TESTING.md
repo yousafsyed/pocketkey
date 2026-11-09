@@ -37,6 +37,11 @@ the phone first). Watch logs in a second terminal:
 
 ## M4: makeCredential via QR
 
+Verified 2026-11-09 with Android (Google Password Manager) and iPhone
+(iCloud Keychain), from Firefox and Chrome. The iPhone needs the
+`rp.name`/`user.displayName` fill-in in `src/ctap2/compat.rs`; without it the
+phone closes the tunnel without replying.
+
 | # | Step | Expect |
 |---|------|--------|
 | 4.1 | webauthn.io, new username, Register, choose security key | QR; phone offers to save the passkey in Google Password Manager |
