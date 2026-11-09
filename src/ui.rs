@@ -18,8 +18,8 @@ use tracing::warn;
 
 use crate::hybrid::Status;
 
-const WINDOW_SIZE: [f32; 2] = [380.0, 500.0];
-const QR_PIXELS: f32 = 300.0;
+const WINDOW_SIZE: [f32; 2] = [380.0, 560.0];
+const QR_PIXELS: f32 = 272.0;
 /// How long the window stays after a successful request.
 const DONE_LINGER: Duration = Duration::from_millis(1200);
 /// How long an error message stays before the window closes.
@@ -32,7 +32,7 @@ pub fn show(
 ) -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("pocketkey: sign in with your phone")
+            .with_title("pocketkey")
             .with_app_id("pocketkey")
             .with_inner_size(WINDOW_SIZE)
             .with_min_inner_size(WINDOW_SIZE)
@@ -50,6 +50,9 @@ pub fn show(
                 qr: None,
                 terminal_since: None,
                 cancelled: false,
+                screenshot_dir: std::env::var_os("POCKETKEY_UI_SCREENSHOT_DIR").map(Into::into),
+                last_shot_status: None,
+                shot_count: 0,
             }))
         }),
     )
@@ -63,9 +66,66 @@ struct App {
     /// When the request reached Done/Failed, for the linger timer.
     terminal_since: Option<(Status, Instant)>,
     cancelled: bool,
+    /// Debug aid: when `POCKETKEY_UI_SCREENSHOT_DIR` is set, every status
+    /// change is captured to `<dir>/<n>-<status>.ppm`.
+    screenshot_dir: Option<std::path::PathBuf>,
+    last_shot_status: Option<String>,
+    shot_count: u32,
 }
 
 impl App {
+    fn maybe_capture(&mut self, ctx: &egui::Context, shown: &Status) {
+        let Some(dir) = &self.screenshot_dir else {
+            return;
+        };
+        let label = format!("{shown:?}")
+            .split([' ', '{'])
+            .next()
+            .unwrap_or("state")
+            .to_string();
+        if self.last_shot_status.as_deref() == Some(label.as_str()) {
+            return;
+        }
+        self.last_shot_status = Some(label.clone());
+        self.shot_count += 1;
+        let path = dir.join(format!("{:02}-{label}.ppm", self.shot_count));
+        // Give the new state one frame to render, then capture.
+        ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::UserData::new(
+            path.to_string_lossy().to_string(),
+        )));
+    }
+
+    fn save_screenshots(&self, ctx: &egui::Context) {
+        if self.screenshot_dir.is_none() {
+            return;
+        }
+        let shots: Vec<(String, std::sync::Arc<ColorImage>)> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Screenshot {
+                        user_data, image, ..
+                    } => user_data
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.downcast_ref::<String>().cloned())
+                        .map(|p| (p, image.clone())),
+                    _ => None,
+                })
+                .collect()
+        });
+        for (path, image) in shots {
+            let [w, h] = image.size;
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            for px in image.pixels.iter() {
+                out.extend_from_slice(&[px.r(), px.g(), px.b()]);
+            }
+            if let Err(e) = std::fs::write(&path, out) {
+                warn!(error = %e, path, "could not write screenshot");
+            }
+        }
+    }
+
     fn cancel(&mut self) {
         if !self.cancelled {
             self.cancelled = true;
@@ -133,76 +193,242 @@ impl eframe::App for App {
             _ => status,
         };
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(12.0);
-                ui.heading("Sign in with your phone");
-                ui.add_space(12.0);
+        self.save_screenshots(ctx);
+        self.maybe_capture(ctx, &shown);
 
-                let (line, show_cancel) = match &shown {
-                    Status::ShowQr { payload } => {
-                        let payload = payload.clone();
-                        if let Some(tex) = self.qr_texture(ctx, &payload) {
-                            ui.image((tex.id(), egui::vec2(QR_PIXELS, QR_PIXELS)));
+        let palette = Palette::from(ctx.style().visuals.dark_mode);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(palette.background).inner_margin(egui::Margin::symmetric(28, 24)))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("POCKETKEY")
+                            .size(11.0)
+                            .color(palette.muted)
+                            .extra_letter_spacing(2.0),
+                    );
+                    ui.add_space(6.0);
+
+                    let (headline, body, show_cancel) = match &shown {
+                        Status::ShowQr { payload } => {
+                            ui.label(RichText::new("Sign in with your phone").size(20.0).strong().color(palette.text));
+                            ui.add_space(14.0);
+                            let payload = payload.clone();
+                            if let Some(tex) = self.qr_texture(ctx, &payload) {
+                                egui::Frame::new()
+                                    .fill(Color32::WHITE)
+                                    .corner_radius(14.0)
+                                    .inner_margin(10.0)
+                                    .shadow(egui::epaint::Shadow {
+                                        offset: [0, 4],
+                                        blur: 16,
+                                        spread: 0,
+                                        color: Color32::from_black_alpha(40),
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.image((tex.id(), egui::vec2(QR_PIXELS, QR_PIXELS)));
+                                    });
+                            }
+                            ui.add_space(14.0);
+                            (
+                                None,
+                                "Open your phone's camera and scan the code,\nthen approve the sign-in on the phone."
+                                    .to_string(),
+                                true,
+                            )
                         }
-                        ui.add_space(10.0);
-                        (
-                            "Scan this QR code with your phone's camera".to_string(),
-                            true,
-                        )
-                    }
-                    Status::LinkedWaitingForPhone { name } => {
-                        phone_glyph(ui);
-                        (format!("Check your phone ({name})"), true)
-                    }
-                    Status::PhoneFound => {
-                        phone_glyph(ui);
-                        ("Phone found, connecting…".to_string(), true)
-                    }
-                    Status::Connected => {
-                        phone_glyph(ui);
-                        ("Connected, sending request…".to_string(), true)
-                    }
-                    Status::WaitingForUser => {
-                        phone_glyph(ui);
-                        ("Confirm on your phone".to_string(), true)
-                    }
-                    Status::Done => {
-                        ui.add_space(60.0);
-                        ui.label(
-                            RichText::new("✓")
-                                .size(72.0)
-                                .color(Color32::from_rgb(0x2e, 0xa0, 0x43)),
-                        );
-                        ("Done".to_string(), false)
-                    }
-                    Status::Failed(msg) => {
-                        ui.add_space(60.0);
-                        ui.label(
-                            RichText::new("✕")
-                                .size(72.0)
-                                .color(Color32::from_rgb(0xc0, 0x1c, 0x28)),
-                        );
-                        (format!("Failed: {msg}"), false)
-                    }
-                    Status::Idle => ("Starting…".to_string(), true),
-                };
+                        Status::LinkedWaitingForPhone { name } => {
+                            draw_phone(ui, &palette, true);
+                            (
+                                Some("Check your phone".to_string()),
+                                format!("We sent a notification to {name}.\nApprove the sign-in there."),
+                                true,
+                            )
+                        }
+                        Status::PhoneFound => {
+                            draw_phone(ui, &palette, true);
+                            (
+                                Some("Phone found".to_string()),
+                                "Setting up a secure connection…".to_string(),
+                                true,
+                            )
+                        }
+                        Status::Connected => {
+                            draw_phone(ui, &palette, true);
+                            (
+                                Some("Connected".to_string()),
+                                "Sending the request to your phone…".to_string(),
+                                true,
+                            )
+                        }
+                        Status::WaitingForUser => {
+                            draw_phone(ui, &palette, true);
+                            (
+                                Some("Confirm on your phone".to_string()),
+                                "Use your fingerprint, face or PIN on the phone to continue.".to_string(),
+                                true,
+                            )
+                        }
+                        Status::Done => {
+                            draw_badge(ui, palette.success, Glyph::Check);
+                            (
+                                Some("Done".to_string()),
+                                "You can return to your browser.".to_string(),
+                                false,
+                            )
+                        }
+                        Status::Failed(msg) => {
+                            draw_badge(ui, palette.danger, Glyph::Cross);
+                            (Some("Something went wrong".to_string()), msg.clone(), false)
+                        }
+                        Status::Idle => {
+                            draw_phone(ui, &palette, true);
+                            (Some("Starting…".to_string()), String::new(), true)
+                        }
+                    };
 
-                ui.add_space(8.0);
-                ui.label(RichText::new(line).size(15.0));
-                ui.add_space(16.0);
-                if show_cancel && ui.button(RichText::new("  Cancel  ").size(15.0)).clicked() {
-                    self.cancel();
-                }
+                    if let Some(h) = headline {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(h).size(20.0).strong().color(palette.text));
+                    }
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(body).size(14.0).color(palette.muted));
+
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                        ui.add_space(4.0);
+                        if show_cancel {
+                            let button = egui::Button::new(RichText::new("Cancel").size(15.0).color(palette.text))
+                                .fill(palette.button)
+                                .stroke(egui::Stroke::new(1.0_f32, palette.button_border))
+                                .corner_radius(10.0)
+                                .min_size(egui::vec2(ui.available_width(), 40.0));
+                            if ui.add(button).clicked() {
+                                self.cancel();
+                            }
+                        }
+                    });
+                });
             });
-        });
     }
 }
 
-fn phone_glyph(ui: &mut egui::Ui) {
-    ui.add_space(60.0);
-    ui.label(RichText::new("📱").size(96.0));
-    ui.add_space(30.0);
+struct Palette {
+    background: Color32,
+    text: Color32,
+    muted: Color32,
+    accent: Color32,
+    success: Color32,
+    danger: Color32,
+    button: Color32,
+    button_border: Color32,
+}
+
+impl Palette {
+    fn from(dark: bool) -> Self {
+        if dark {
+            Self {
+                background: Color32::from_rgb(0x1e, 0x1f, 0x24),
+                text: Color32::from_rgb(0xf2, 0xf2, 0xf5),
+                muted: Color32::from_rgb(0xa0, 0xa4, 0xad),
+                accent: Color32::from_rgb(0x5b, 0x9c, 0xff),
+                success: Color32::from_rgb(0x3d, 0xc2, 0x6b),
+                danger: Color32::from_rgb(0xe5, 0x53, 0x5a),
+                button: Color32::from_rgb(0x2b, 0x2d, 0x34),
+                button_border: Color32::from_rgb(0x3d, 0x40, 0x49),
+            }
+        } else {
+            Self {
+                background: Color32::from_rgb(0xfa, 0xfa, 0xfb),
+                text: Color32::from_rgb(0x1c, 0x1e, 0x24),
+                muted: Color32::from_rgb(0x66, 0x6b, 0x75),
+                accent: Color32::from_rgb(0x1a, 0x73, 0xe8),
+                success: Color32::from_rgb(0x1e, 0x8e, 0x3e),
+                danger: Color32::from_rgb(0xd9, 0x30, 0x25),
+                button: Color32::WHITE,
+                button_border: Color32::from_rgb(0xd0, 0xd3, 0xd9),
+            }
+        }
+    }
+}
+
+enum Glyph {
+    Check,
+    Cross,
+}
+
+/// A phone outline drawn with the painter, optionally with a spinner on screen.
+fn draw_phone(ui: &mut egui::Ui, palette: &Palette, busy: bool) {
+    ui.add_space(26.0);
+    let size = egui::vec2(96.0, 170.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    let stroke = egui::Stroke::new(3.0_f32, palette.accent);
+    painter.rect_stroke(rect, 16.0, stroke, egui::StrokeKind::Inside);
+    // Screen.
+    let screen = rect.shrink2(egui::vec2(10.0, 18.0));
+    painter.rect_stroke(
+        screen,
+        6.0,
+        egui::Stroke::new(1.5_f32, palette.muted),
+        egui::StrokeKind::Inside,
+    );
+    // Speaker and home indicator.
+    painter.line_segment(
+        [
+            rect.center_top() + egui::vec2(-12.0, 9.0),
+            rect.center_top() + egui::vec2(12.0, 9.0),
+        ],
+        egui::Stroke::new(2.0_f32, palette.muted),
+    );
+    painter.line_segment(
+        [
+            rect.center_bottom() + egui::vec2(-16.0, -9.0),
+            rect.center_bottom() + egui::vec2(16.0, -9.0),
+        ],
+        egui::Stroke::new(2.5_f32, palette.muted),
+    );
+    if busy {
+        let spinner_rect = egui::Rect::from_center_size(screen.center(), egui::vec2(28.0, 28.0));
+        egui::Spinner::new()
+            .size(28.0)
+            .color(palette.accent)
+            .paint_at(ui, spinner_rect);
+    }
+    ui.add_space(26.0);
+}
+
+/// A filled circle with a check mark or a cross.
+fn draw_badge(ui: &mut egui::Ui, color: Color32, glyph: Glyph) {
+    ui.add_space(56.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(110.0, 110.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let c = rect.center();
+    painter.circle_filled(c, 52.0, color);
+    let stroke = egui::Stroke::new(7.0_f32, Color32::WHITE);
+    match glyph {
+        Glyph::Check => {
+            painter.line_segment(
+                [c + egui::vec2(-22.0, 2.0), c + egui::vec2(-7.0, 17.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [c + egui::vec2(-7.0, 17.0), c + egui::vec2(24.0, -16.0)],
+                stroke,
+            );
+        }
+        Glyph::Cross => {
+            painter.line_segment(
+                [c + egui::vec2(-18.0, -18.0), c + egui::vec2(18.0, 18.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [c + egui::vec2(-18.0, 18.0), c + egui::vec2(18.0, -18.0)],
+                stroke,
+            );
+        }
+    }
+    ui.add_space(56.0);
 }
 
 /// Render the QR code with a 4-module quiet zone, one pixel per module.
