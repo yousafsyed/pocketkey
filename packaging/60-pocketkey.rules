@@ -4,4 +4,7 @@
 # grant an ACL on the node to the user of the active seat, so the pocketkey
 # user service can run without root. Note this allows any program in that
 # session to create virtual HID devices (including keyboards); see README.
+#
+# Must sort before 73-seat-late.rules, which is where the uaccess tag is
+# turned into an ACL; a 99- file would add the tag too late.
 KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess"

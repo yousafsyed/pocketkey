@@ -215,7 +215,7 @@ pocketkey/
 │   │   └── store.rs   `PxpKnownDeviceInfoStore` impl: JSON file, 0600, list()
 │   └── ui.rs          eframe window: QR / "Check your phone" / status / Cancel
 ├── packaging/
-│   ├── 99-pocketkey.rules
+│   ├── 60-pocketkey.rules
 │   └── pocketkey.service
 ├── debian/            control, rules, changelog, install, copyright, source/format
 └── .github/workflows/ci.yml

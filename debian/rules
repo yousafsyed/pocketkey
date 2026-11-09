@@ -15,7 +15,7 @@ override_dh_auto_test:
 
 override_dh_auto_install:
 	install -Dm755 target/release/pocketkey debian/pocketkey/usr/bin/pocketkey
-	install -Dm644 packaging/99-pocketkey.rules debian/pocketkey/usr/lib/udev/rules.d/99-pocketkey.rules
+	install -Dm644 packaging/60-pocketkey.rules debian/pocketkey/usr/lib/udev/rules.d/60-pocketkey.rules
 	install -Dm644 packaging/pocketkey-modules.conf debian/pocketkey/usr/lib/modules-load.d/pocketkey.conf
 	install -Dm644 packaging/pocketkey.service debian/pocketkey/usr/lib/systemd/user/pocketkey.service
 

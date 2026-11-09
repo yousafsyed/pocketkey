@@ -33,7 +33,8 @@ fmt:
 install:
 	@test -x target/release/pocketkey || { echo "target/release/pocketkey not found; run 'make build' first"; exit 1; }
 	install -Dm755 target/release/pocketkey $(DESTDIR)$(BINDIR)/pocketkey
-	install -Dm644 packaging/99-pocketkey.rules $(DESTDIR)$(UDEV_RULES_DIR)/99-pocketkey.rules
+	install -Dm644 packaging/60-pocketkey.rules $(DESTDIR)$(UDEV_RULES_DIR)/60-pocketkey.rules
+	rm -f $(DESTDIR)$(UDEV_RULES_DIR)/99-pocketkey.rules
 	install -Dm644 packaging/pocketkey-modules.conf $(DESTDIR)$(MODULES_LOAD_DIR)/pocketkey.conf
 	@if [ -z "$(DESTDIR)" ]; then \
 		udevadm control --reload; \
@@ -51,7 +52,7 @@ install-user:
 	systemctl --user --no-pager status pocketkey.service || true
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/pocketkey $(DESTDIR)$(UDEV_RULES_DIR)/99-pocketkey.rules $(DESTDIR)$(MODULES_LOAD_DIR)/pocketkey.conf
+	rm -f $(DESTDIR)$(BINDIR)/pocketkey $(DESTDIR)$(UDEV_RULES_DIR)/60-pocketkey.rules $(DESTDIR)$(MODULES_LOAD_DIR)/pocketkey.conf
 	-udevadm control --reload
 
 uninstall-user:
