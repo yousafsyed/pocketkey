@@ -5,6 +5,8 @@ edition = "2021"
 rust-version = "1.88"
 description = "Virtual FIDO2 USB security key that proxies CTAP2 to a phone over the WebAuthn hybrid transport"
 license = "MIT OR Apache-2.0"
+authors = ["Yousaf Syed <yousafsyed@icloud.com>"]
+repository = "https://github.com/yousafsyed/pocketkey"
 publish = false
 
 [dependencies]
