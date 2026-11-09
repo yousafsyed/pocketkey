@@ -185,17 +185,6 @@ state machine), `src/ctap2.rs` (command dispatch and getInfo),
 
 Copyright (c) 2026 S. Yousaf Ali.
 
-Licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
-  <https://www.apache.org/licenses/LICENSE-2.0>)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or
-  <https://opensource.org/licenses/MIT>)
-
-at your option. Both licenses require that the copyright notice above is kept
-in any copy or derivative of this software.
-
-Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in pocketkey by you, as defined in the Apache-2.0
-license, shall be dual licensed as above, without any additional terms or
-conditions.
+Released under the [MIT License](LICENSE). You may use, modify and
+redistribute pocketkey freely, provided the copyright notice and the license
+text are kept with any copy or substantial portion of it.

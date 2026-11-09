@@ -5,14 +5,7 @@ Source: https://github.com/yousafsyed/pocketkey
 
 Files: *
 Copyright: 2026 S. Yousaf Ali
-License: MIT or Apache-2.0
- This software is dual licensed; use it under either license at your option.
- The full texts ship as LICENSE-MIT and LICENSE-APACHE in the source tree.
- On Debian systems the Apache-2.0 text is in
- /usr/share/common-licenses/Apache-2.0 and the MIT text below.
- .
- MIT License
- .
+License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy
  of this software and associated documentation files (the "Software"), to deal
  in the Software without restriction, including without limitation the rights
