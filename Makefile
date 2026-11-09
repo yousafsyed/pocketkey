@@ -1,7 +1,7 @@
 # pocketkey build/install helpers.
 #
 #   make build            release build (needs libdbus-1-dev; or FEATURES=vendored-dbus)
-#   sudo make install     binary + udev rule (system-wide)
+#   sudo make install     binary + udev rule (system-wide); run `make build` first
 #   make install-user     systemd user unit for the current user, enabled + started
 #   make uninstall-user / sudo make uninstall
 
@@ -27,7 +27,10 @@ clippy:
 fmt:
 	$(CARGO) fmt --check
 
-install: build
+# Installs the already-built binary; run `make build` first (as your user,
+# not root, so cargo from rustup is on PATH).
+install:
+	@test -x target/release/pocketkey || { echo "target/release/pocketkey not found; run 'make build' first"; exit 1; }
 	install -Dm755 target/release/pocketkey $(DESTDIR)$(BINDIR)/pocketkey
 	install -Dm644 packaging/99-pocketkey.rules $(DESTDIR)$(UDEV_RULES_DIR)/99-pocketkey.rules
 	@if [ -z "$(DESTDIR)" ]; then \

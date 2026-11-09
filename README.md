@@ -60,7 +60,7 @@ From source:
 ```sh
 sudo apt install build-essential pkg-config libdbus-1-dev     # build deps
 sudo apt install fido2-tools                                   # optional, for testing
-cargo build --release
+cargo build --release    # as your user
 sudo make install        # /usr/local/bin/pocketkey + udev rule for /dev/uhid
 make install-user        # systemd user service, enabled and started
 ```
