@@ -1,30 +1,32 @@
-//! hybridkey: a virtual FIDO2 USB security key that proxies CTAP2 requests to
+//! pocketkey: a virtual FIDO2 USB security key that proxies CTAP2 requests to
 //! a phone over the WebAuthn hybrid transport.
 //!
 //! Data flow: `/dev/uhid` reports -> [`ctaphid::Transport`] -> CTAP2 payload
 //! -> answered locally by [`ctap2`] or forwarded through [`hybrid`] -> back
 //! out as CTAPHID reports. Exactly one forwarded request is in flight at a
-//! time; while it runs, this loop emits `CTAPHID_KEEPALIVE` every 100 ms.
-
-mod ctap2;
-mod ctaphid;
-mod hybrid;
-mod uhid;
+//! time; while it runs, the daemon emits `CTAPHID_KEEPALIVE` every 100 ms.
+//!
+//! Threads: the tokio runtime (uhid loop, hybrid connection) runs on
+//! background threads; the main thread is reserved for the request window,
+//! which winit requires.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::ctaphid::{Event, KeepaliveStatus, RequestId};
-use crate::hybrid::{HybridError, HybridTransport, Status};
-use crate::uhid::{UhidDevice, UhidEvent};
+use pocketkey::ctaphid::{self, Event, KeepaliveStatus, RequestId};
+use pocketkey::hybrid::pxp_transport::PxpTransport;
+use pocketkey::hybrid::store::FileStore;
+use pocketkey::hybrid::{HybridError, HybridTransport, Status};
+use pocketkey::uhid::{self, UhidDevice, UhidEvent};
+use pocketkey::{ctap2, ui};
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -32,25 +34,95 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(100);
 struct Active {
     id: RequestId,
     task: JoinHandle<Result<Vec<u8>, HybridError>>,
-    status_rx: watch::Receiver<Status>,
     cancel: CancellationToken,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    let transport: Arc<dyn HybridTransport> = Arc::new(hybrid::UnavailableTransport);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("pocketkey-rt")
+        .build()
+        .context("starting tokio runtime")?;
 
-    let mut device = UhidDevice::create().context("creating the virtual FIDO device")?;
+    let store_path = FileStore::default_path().context("locating the linked device store")?;
+    let store =
+        Arc::new(FileStore::open(store_path.clone()).context("opening the linked device store")?);
+    info!(path = %store_path.display(), linked_phones = store.list().len(), "linked device store");
+    let transport: Arc<dyn HybridTransport> = Arc::new(PxpTransport::new(store));
+
+    // Create the device before anything else so permission problems surface immediately.
+    let device = UhidDevice::create().context("creating the virtual FIDO device")?;
     info!(name = uhid::DEVICE_NAME, "virtual FIDO2 key ready");
 
-    let result = run(&mut device, transport).await;
+    let (status_tx, status_rx) = watch::channel(Status::Idle);
+    let (ui_cancel_tx, ui_cancel_rx) = mpsc::unbounded_channel();
+    let mut daemon = runtime.spawn(run(device, transport, status_tx, ui_cancel_rx));
 
+    // Main thread: show the window whenever a request leaves Idle.
+    let mut ui_available =
+        std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
+    if !ui_available {
+        warn!("no WAYLAND_DISPLAY/DISPLAY: running without a window; QR flows cannot be shown");
+    }
+    let mut ui_status = status_rx.clone();
+    let result = loop {
+        // Wait for a request to start, or for the daemon to end.
+        let finished = runtime.block_on(async {
+            loop {
+                tokio::select! {
+                    res = &mut daemon => return Some(res),
+                    changed = ui_status.changed() => {
+                        if changed.is_err() { return None; }
+                        if !matches!(*ui_status.borrow_and_update(), Status::Idle) { return None; }
+                    }
+                }
+            }
+        });
+        if let Some(res) = finished {
+            break res;
+        }
+        if ui_available {
+            if let Err(e) = ui::show(status_rx.clone(), ui_cancel_tx.clone()) {
+                error!(error = %e, "could not open the request window; continuing without one");
+                ui_available = false;
+            }
+        }
+        // Do not reopen until this request is over.
+        let finished = runtime.block_on(async {
+            loop {
+                tokio::select! {
+                    res = &mut daemon => return Some(res),
+                    changed = ui_status.changed() => {
+                        if changed.is_err() { return None; }
+                        if matches!(*ui_status.borrow_and_update(), Status::Idle) { return None; }
+                    }
+                }
+            }
+        });
+        if let Some(res) = finished {
+            break res;
+        }
+    };
+
+    match result {
+        Ok(r) => r,
+        Err(e) => Err(anyhow::anyhow!("daemon task failed: {e}")),
+    }
+}
+
+async fn run(
+    mut device: UhidDevice,
+    transport: Arc<dyn HybridTransport>,
+    status_tx: watch::Sender<Status>,
+    mut ui_cancel_rx: mpsc::UnboundedReceiver<()>,
+) -> anyhow::Result<()> {
+    let result = event_loop(&mut device, transport, &status_tx, &mut ui_cancel_rx).await;
     // Always tear the device down so clients do not see a stale hidraw node.
     if let Err(e) = device.destroy() {
         warn!(error = %e, "destroying uhid device");
@@ -58,7 +130,12 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run(device: &mut UhidDevice, transport: Arc<dyn HybridTransport>) -> anyhow::Result<()> {
+async fn event_loop(
+    device: &mut UhidDevice,
+    transport: Arc<dyn HybridTransport>,
+    status_tx: &watch::Sender<Status>,
+    ui_cancel_rx: &mut mpsc::UnboundedReceiver<()>,
+) -> anyhow::Result<()> {
     let mut hid = ctaphid::Transport::new().with_version(crate_version_bytes());
     let mut ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
@@ -73,7 +150,7 @@ async fn run(device: &mut UhidDevice, transport: Arc<dyn HybridTransport>) -> an
                         let out = hid.handle_report(&report, Instant::now());
                         send_all(device, &out.reports)?;
                         for ev in out.events {
-                            handle_event(ev, &mut hid, &mut active, &transport, device)?;
+                            handle_event(ev, &mut hid, &mut active, &transport, status_tx, device)?;
                         }
                     }
                     UhidEvent::Open => debug!("hidraw node opened by a client"),
@@ -88,7 +165,7 @@ async fn run(device: &mut UhidDevice, transport: Arc<dyn HybridTransport>) -> an
             _ = ticker.tick() => {
                 send_all(device, &hid.tick(Instant::now()))?;
                 if let Some(a) = &active {
-                    let status = if a.status_rx.borrow().user_action_pending() {
+                    let status = if status_tx.borrow().user_action_pending() {
                         KeepaliveStatus::UpNeeded
                     } else {
                         KeepaliveStatus::Processing
@@ -105,7 +182,7 @@ async fn run(device: &mut UhidDevice, transport: Arc<dyn HybridTransport>) -> an
                 let a = active.take().expect("checked");
                 let payload = match result {
                     Ok(Ok(bytes)) => {
-                        debug!(status = bytes.first().copied().unwrap_or(0), len = bytes.len(), "phone replied");
+                        info!(status = bytes.first().copied().unwrap_or(0), "phone replied");
                         bytes
                     }
                     Ok(Err(e)) => {
@@ -118,6 +195,14 @@ async fn run(device: &mut UhidDevice, transport: Arc<dyn HybridTransport>) -> an
                     }
                 };
                 send_all(device, &hid.respond(a.id, &payload))?;
+                let _ = status_tx.send(Status::Idle);
+            }
+
+            Some(()) = ui_cancel_rx.recv() => {
+                if let Some(a) = &active {
+                    info!("request cancelled from the window");
+                    a.cancel.cancel();
+                }
             }
 
             _ = sigterm.recv() => { info!("SIGTERM received, shutting down"); break; }
@@ -129,6 +214,7 @@ async fn run(device: &mut UhidDevice, transport: Arc<dyn HybridTransport>) -> an
         a.cancel.cancel();
         a.task.abort();
     }
+    let _ = status_tx.send(Status::Idle);
     Ok(())
 }
 
@@ -137,6 +223,7 @@ fn handle_event(
     hid: &mut ctaphid::Transport,
     active: &mut Option<Active>,
     transport: &Arc<dyn HybridTransport>,
+    status_tx: &watch::Sender<Status>,
     device: &mut UhidDevice,
 ) -> anyhow::Result<()> {
     match ev {
@@ -156,19 +243,14 @@ fn handle_event(
                         return Ok(());
                     }
                     info!(?hint, "forwarding request to the phone");
-                    let (status_tx, status_rx) = watch::channel(Status::Idle);
                     let cancel = CancellationToken::new();
                     let task = tokio::spawn({
                         let transport = Arc::clone(transport);
                         let cancel = cancel.clone();
+                        let status_tx = status_tx.clone();
                         async move { transport.ctap(payload, hint, status_tx, cancel).await }
                     });
-                    *active = Some(Active {
-                        id,
-                        task,
-                        status_rx,
-                        cancel,
-                    });
+                    *active = Some(Active { id, task, cancel });
                 }
             }
         }

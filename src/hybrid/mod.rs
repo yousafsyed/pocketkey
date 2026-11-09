@@ -2,7 +2,10 @@
 //!
 //! The daemon talks to this module through the [`HybridTransport`] trait so
 //! the request lifecycle in `main` can be exercised with a fake. The real
-//! implementation over the `pxp` crate lives in `pxp.rs` (milestone M3).
+//! implementation over the `pxp` crate lives in `pxp_transport.rs`.
+
+pub mod pxp_transport;
+pub mod store;
 
 use async_trait::async_trait;
 use tokio::sync::watch;
@@ -19,8 +22,6 @@ pub enum Hint {
 /// User-visible progress of a request. Drives the UI window and the
 /// CTAPHID keepalive status (`WaitingForUser` is status 2, everything else
 /// while active is status 1).
-// Variants are constructed by the real transport (M3).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Status {
     #[default]
@@ -50,22 +51,18 @@ impl Status {
     }
 }
 
-// Variants are constructed by the real transport (M3).
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum HybridError {
     #[error("request cancelled")]
     Cancelled,
     #[error("timed out waiting for the phone")]
     Timeout,
-    #[error("the phone reported no matching credentials")]
-    NoCredentials,
     #[error("no Bluetooth adapter available")]
     NoBluetooth,
     #[error("hybrid transport error: {0}")]
     Transport(String),
-    #[error("hybrid transport not available in this build")]
-    Unavailable,
+    #[error("operation not allowed")]
+    NotAllowed,
 }
 
 #[async_trait]
@@ -80,22 +77,4 @@ pub trait HybridTransport: Send + Sync {
         status: watch::Sender<Status>,
         cancel: CancellationToken,
     ) -> Result<Vec<u8>, HybridError>;
-}
-
-/// Placeholder used until the real transport lands: every forwarded request
-/// fails immediately with `CTAP1_ERR_OTHER`.
-pub struct UnavailableTransport;
-
-#[async_trait]
-impl HybridTransport for UnavailableTransport {
-    async fn ctap(
-        &self,
-        _frame: Vec<u8>,
-        _hint: Hint,
-        status: watch::Sender<Status>,
-        _cancel: CancellationToken,
-    ) -> Result<Vec<u8>, HybridError> {
-        let _ = status.send(Status::Failed(HybridError::Unavailable.to_string()));
-        Err(HybridError::Unavailable)
-    }
 }

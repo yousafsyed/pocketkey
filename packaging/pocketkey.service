@@ -1,12 +1,12 @@
 [Unit]
-Description=hybridkey virtual FIDO2 security key (phone hybrid transport proxy)
-Documentation=https://github.com/yousaf/hybridkey
+Description=pocketkey virtual FIDO2 security key (phone hybrid transport proxy)
+Documentation=https://github.com/yousafsyed/pocketkey
 After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/hybridkey
+ExecStart=/usr/bin/pocketkey
 Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info

@@ -1,6 +1,6 @@
-# hybridkey: implementation plan
+# pocketkey: implementation plan
 
-Status: awaiting your OK before the bulk of the code.
+Status: approved 2026-11-09 (pxp-only, forward up:false, eframe, hand-rolled uhid, VID/PID 0x1209/0x0001). Project renamed to pocketkey (repo yousafsyed/pocketkey).
 
 ## 0. Findings from reading the dependencies
 
@@ -201,7 +201,7 @@ on the main thread when a request arrives and closed when it completes
 ## 1. Crate layout
 
 ```
-hybridkey/
+pocketkey/
 ├── Cargo.toml
 ├── PLAN.md  README.md  TESTING.md  Justfile
 ├── src/
@@ -215,8 +215,8 @@ hybridkey/
 │   │   └── store.rs   `PxpKnownDeviceInfoStore` impl: JSON file, 0600, list()
 │   └── ui.rs          eframe window: QR / "Check your phone" / status / Cancel
 ├── packaging/
-│   ├── 99-hybridkey.rules
-│   └── hybridkey.service
+│   ├── 99-pocketkey.rules
+│   └── pocketkey.service
 ├── debian/            control, rules, changelog, install, copyright, source/format
 └── .github/workflows/ci.yml
 ```
@@ -234,7 +234,7 @@ rolled `$XDG_DATA_HOME` lookup (I'll hand-roll; 10 lines, no new dep).
 ### uhid
 
 - Open `/dev/uhid` `O_RDWR|O_NONBLOCK|O_CLOEXEC`, write `UHID_CREATE2`
-  with name "hybridkey virtual FIDO key", bus USB (0x03), VID/PID
+  with name "pocketkey virtual FIDO key", bus USB (0x03), VID/PID
   (I'll use 0x1209/0x0001 pid.codes test range unless you have a preference;
   tpm-fido's are 0x15d9/0x0a37), the FIDO report descriptor (rdesc identical
   to tpm-fido / CTAP spec: Usage Page F1D0, Usage 01, Collection App, 64-byte
@@ -335,7 +335,7 @@ Real impl (`PxpTransport`):
    `tunnel.close()` (sends Shutdown so the phone shows success).
 Cancel token -> drop handle (aborts the task, stops the scan) at any stage.
 
-Store: `$XDG_DATA_HOME/hybridkey/linked_devices.json` (fallback
+Store: `$XDG_DATA_HOME/pocketkey/linked_devices.json` (fallback
 `~/.local/share`), dir 0700, file 0600, atomic write via temp+rename, fields
 hex/base64 encoded, `last_used` timestamp for ordering. Implements
 `PxpKnownDeviceInfoStore` (put/delete) plus `list()`.

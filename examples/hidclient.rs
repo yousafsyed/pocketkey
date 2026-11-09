@@ -1,11 +1,11 @@
 //! Minimal CTAPHID client for checking the daemon without libfido2.
 //!
-//! Finds the hybridkey hidraw node (or takes a path as argument), sends
+//! Finds the pocketkey hidraw node (or takes a path as argument), sends
 //! `CTAPHID_INIT` on the broadcast channel, then `authenticatorGetInfo`, and
 //! prints the decoded replies.
 //!
 //! ```sh
-//! cargo run --example hidclient [/dev/hidrawN]
+//! cargo run --example hidclient --features vendored-dbus [/dev/hidrawN]
 //! ```
 
 use std::fs::{self, OpenOptions};
@@ -69,7 +69,7 @@ fn read_message(f: &mut fs::File, cid: &[u8; 4]) -> (u8, Vec<u8>) {
 
 fn main() {
     let path = std::env::args().nth(1).map(PathBuf::from).or_else(find_device).unwrap_or_else(|| {
-        eprintln!("hybridkey hidraw device not found; is the daemon running? (pass /dev/hidrawN explicitly)");
+        eprintln!("pocketkey hidraw device not found; is the daemon running? (pass /dev/hidrawN explicitly)");
         std::process::exit(1);
     });
     println!("device: {}", path.display());

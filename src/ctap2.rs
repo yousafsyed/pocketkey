@@ -29,7 +29,6 @@ pub mod status {
     pub const CTAP1_ERR_INVALID_LENGTH: u8 = 0x03;
     pub const CTAP2_ERR_OPERATION_DENIED: u8 = 0x27;
     pub const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
-    pub const CTAP2_ERR_NO_CREDENTIALS: u8 = 0x2E;
     pub const CTAP2_ERR_USER_ACTION_TIMEOUT: u8 = 0x2F;
     pub const CTAP2_ERR_NOT_ALLOWED: u8 = 0x30;
     pub const CTAP2_ERR_REQUEST_TOO_LARGE: u8 = 0x39;
@@ -127,10 +126,8 @@ pub fn status_for_hybrid_error(err: &HybridError) -> u8 {
     match err {
         HybridError::Cancelled => status::CTAP2_ERR_KEEPALIVE_CANCEL,
         HybridError::Timeout => status::CTAP2_ERR_USER_ACTION_TIMEOUT,
-        HybridError::NoCredentials => status::CTAP2_ERR_NO_CREDENTIALS,
-        HybridError::NoBluetooth | HybridError::Transport(_) | HybridError::Unavailable => {
-            status::CTAP1_ERR_OTHER
-        }
+        HybridError::NotAllowed => status::CTAP2_ERR_NOT_ALLOWED,
+        HybridError::NoBluetooth | HybridError::Transport(_) => status::CTAP1_ERR_OTHER,
     }
 }
 
@@ -248,8 +245,8 @@ mod tests {
     fn hybrid_errors_map_to_ctap2_statuses() {
         assert_eq!(status_for_hybrid_error(&HybridError::Cancelled), 0x2D);
         assert_eq!(status_for_hybrid_error(&HybridError::Timeout), 0x2F);
-        assert_eq!(status_for_hybrid_error(&HybridError::NoCredentials), 0x2E);
         assert_eq!(status_for_hybrid_error(&HybridError::NoBluetooth), 0x7F);
+        assert_eq!(status_for_hybrid_error(&HybridError::NotAllowed), 0x30);
         assert_eq!(
             status_for_hybrid_error(&HybridError::Transport("x".into())),
             0x7F

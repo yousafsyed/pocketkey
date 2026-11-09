@@ -43,7 +43,7 @@ pub const FIDO_REPORT_DESCRIPTOR: [u8; 34] = [
     0xC0, //             End Collection
 ];
 
-pub const DEVICE_NAME: &str = "hybridkey virtual FIDO key";
+pub const DEVICE_NAME: &str = "pocketkey virtual FIDO key";
 /// pid.codes test VID/PID. Not a registered product id; fine for a virtual
 /// device that never leaves the machine.
 pub const VENDOR_ID: u32 = 0x1209;
@@ -151,7 +151,7 @@ impl UhidDevice {
                     io::Error::new(
                         e.kind(),
                         format!(
-                            "{}: permission denied. Install packaging/99-hybridkey.rules into \
+                            "{}: permission denied. Install packaging/99-pocketkey.rules into \
                              /etc/udev/rules.d/ and re-plug (sudo udevadm trigger /dev/uhid) \
                              so your session gets access to /dev/uhid",
                             path.display()
@@ -347,7 +347,7 @@ fn create2_event() -> [u8; UHID_EVENT_SIZE] {
     ev[..4].copy_from_slice(&UHID_CREATE2.to_le_bytes());
     let name = DEVICE_NAME.as_bytes();
     ev[create2::NAME..create2::NAME + name.len()].copy_from_slice(name);
-    let phys = b"hybridkey";
+    let phys = b"pocketkey";
     ev[create2::PHYS..create2::PHYS + phys.len()].copy_from_slice(phys);
     ev[create2::RD_SIZE..create2::RD_SIZE + 2]
         .copy_from_slice(&(FIDO_REPORT_DESCRIPTOR.len() as u16).to_le_bytes());
