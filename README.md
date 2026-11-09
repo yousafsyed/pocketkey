@@ -183,8 +183,19 @@ state machine), `src/ctap2.rs` (command dispatch and getInfo),
 
 ## License
 
-Copyright (c) 2026 S. Yousaf Ali.
+Copyright (c) 2026 S. Yousaf Ali. All rights reserved.
 
-Released under the [MIT License](LICENSE). You may use, modify and
-redistribute pocketkey freely, provided the copyright notice and the license
-text are kept with any copy or substantial portion of it.
+pocketkey is **source-available** under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md):
+
+- **Free for personal and noncommercial use.** Individuals, hobbyists,
+  non-profits, educational and research use may use, modify and share it at
+  no cost, as long as the copyright notice is kept.
+- **Commercial use requires a paid license.** Using pocketkey in or for a
+  business, or in a product or service you sell, needs a commercial license
+  from the author. Contact <yousafsyed@icloud.com>.
+
+pocketkey builds on the LGPL-2.1 `pxp` crate from
+[libwebauthn](https://github.com/linux-credentials/libwebauthn); its terms
+continue to apply to that component (see the notes at the end of
+[LICENSE.md](LICENSE.md)).
