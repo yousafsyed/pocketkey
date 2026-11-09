@@ -18,11 +18,16 @@ use ciborium::Value;
 /// Re-encode `cbor` canonically. Returns `None` if it is not valid CBOR, in
 /// which case callers should forward the original bytes unchanged.
 pub fn canonicalize(cbor: &[u8]) -> Option<Vec<u8>> {
-    let mut value: Value = ciborium::from_reader(cbor).ok()?;
+    let value: Value = ciborium::from_reader(cbor).ok()?;
+    Some(encode_canonical(value))
+}
+
+/// Encode an already decoded item with every map in canonical key order.
+pub fn encode_canonical(mut value: Value) -> Vec<u8> {
     sort_maps(&mut value);
-    let mut out = Vec::with_capacity(cbor.len());
-    ciborium::into_writer(&value, &mut out).ok()?;
-    Some(out)
+    let mut out = Vec::new();
+    ciborium::into_writer(&value, &mut out).expect("encoding into a Vec cannot fail");
+    out
 }
 
 fn sort_maps(value: &mut Value) {

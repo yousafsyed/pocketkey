@@ -1,13 +1,13 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: pocketkey
-Upstream-Contact: S. Yousaf Ali <yousafsyed@icloud.com>
+Upstream-Contact: S. Yousaf Ali (https://github.com/yousafsyed)
 Source: https://github.com/yousafsyed/pocketkey
 
 Files: *
 Copyright: 2026 S. Yousaf Ali
 License: PolyForm-Noncommercial-1.0.0
  Free for noncommercial use; commercial use requires a license from the
- copyright holder (yousafsyed@icloud.com). Full text in LICENSE.md in the
+ copyright holder (https://github.com/yousafsyed). Full text in LICENSE.md in the
  source tree and at https://polyformproject.org/licenses/noncommercial/1.0.0
  .
  This program statically links the pxp crate (libwebauthn project), which is

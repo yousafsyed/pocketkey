@@ -8,6 +8,7 @@
 //! module.
 
 pub mod canonical;
+pub mod compat;
 pub mod describe;
 pub mod preflight;
 
@@ -131,18 +132,26 @@ impl Ctap2 {
     }
 }
 
-/// `cmd ++ cbor` with the CBOR in canonical key order (see [`canonical`]).
-/// Falls back to the original bytes if they do not decode; the phone will
-/// then produce the error itself.
+/// `cmd ++ cbor` with the CBOR in canonical key order (see [`canonical`]),
+/// after the makeCredential fill-ins of [`compat`]. Falls back to the
+/// original bytes if they do not decode; the phone will then produce the
+/// error itself.
 fn forwardable(cmd: u8, cbor: &[u8]) -> Vec<u8> {
-    let body = match canonical::canonicalize(cbor) {
-        Some(canonical) => {
+    let body = match ciborium::from_reader::<Value, _>(cbor) {
+        Ok(mut value) => {
+            if cmd == command::MAKE_CREDENTIAL {
+                let edits = compat::complete_make_credential(&mut value);
+                if !edits.is_empty() {
+                    tracing::debug!(?edits, "completed makeCredential request for the phone");
+                }
+            }
+            let canonical = canonical::encode_canonical(value);
             if canonical != cbor {
-                tracing::debug!("re-encoded request CBOR in canonical key order");
+                tracing::debug!("re-encoded request CBOR for the phone");
             }
             canonical
         }
-        None => cbor.to_vec(),
+        Err(_) => cbor.to_vec(),
     };
     let mut frame = Vec::with_capacity(1 + body.len());
     frame.push(cmd);

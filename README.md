@@ -36,11 +36,14 @@ Firefox ──hidraw──▶ /dev/uhid ──▶ pocketkey ──BLE + wss tunn
    [libwebauthn](https://github.com/linux-credentials/libwebauthn) project.
 3. The CTAP2 request is forwarded to the phone, which prompts for biometrics
    and returns the assertion / attestation. The response bytes go back to
-   Firefox unchanged. The only change made to a request is re-encoding its
-   CBOR in canonical key order: Firefox writes some maps out of order and
-   Android's hybrid authenticator rejects those outright; values such as
-   `clientDataHash` and credential ids are preserved exactly. pocketkey never
-   sees or stores a private key.
+   Firefox unchanged. Requests are forwarded with two small adjustments
+   that strict phones need: the CBOR is re-encoded in canonical key order
+   (Firefox writes some maps out of order and Android rejects those), and
+   for registration the display labels Firefox leaves out are filled in
+   (`rp.name` = `rp.id`, `user.displayName` = `user.name`; iPhones reject a
+   request without them) while `false` extension inputs are dropped. Values
+   such as `clientDataHash`, ids, algorithms and options are preserved
+   exactly. pocketkey never sees or stores a private key.
 4. If the phone sends linking data after a QR session, pocketkey stores it so
    the next request needs no QR. Several phones can be linked. (Current
    Android/Google Password Manager phones do not send it; see "Use".)
@@ -193,7 +196,8 @@ pocketkey is **source-available** under the
   no cost, as long as the copyright notice is kept.
 - **Commercial use requires a paid license.** Using pocketkey in or for a
   business, or in a product or service you sell, needs a commercial license
-  from the author. Contact <yousafsyed@icloud.com>.
+  from the author: open an issue or discussion on
+  [GitHub](https://github.com/yousafsyed/pocketkey).
 
 pocketkey builds on the LGPL-2.1 `pxp` crate from
 [libwebauthn](https://github.com/linux-credentials/libwebauthn); its terms

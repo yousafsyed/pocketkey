@@ -77,7 +77,7 @@ The **licensor** is the individual or entity offering these terms, and the **sof
 Required Notice: Copyright (c) 2026 S. Yousaf Ali (https://github.com/yousafsyed/pocketkey)
 
 Commercial use of pocketkey requires a separate license from the licensor.
-Contact: yousafsyed@icloud.com
+Contact: https://github.com/yousafsyed (open an issue or discussion on the pocketkey repository)
 
 Third-party components: pocketkey links the `pxp` crate from the libwebauthn
 project (https://github.com/linux-credentials/libwebauthn), licensed under the
