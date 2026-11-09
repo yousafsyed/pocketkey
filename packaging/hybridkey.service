@@ -1,0 +1,17 @@
+[Unit]
+Description=hybridkey virtual FIDO2 security key (phone hybrid transport proxy)
+Documentation=https://github.com/yousaf/hybridkey
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/hybridkey
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+# Keep the window on the user's display.
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+
+[Install]
+WantedBy=default.target
