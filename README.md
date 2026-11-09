@@ -34,9 +34,13 @@ Firefox ──hidraw──▶ /dev/uhid ──▶ pocketkey ──BLE + wss tunn
    prove it is nearby, and both sides connect through a tunnel server with
    end-to-end encryption (Noise). This is the `pxp` crate from the
    [libwebauthn](https://github.com/linux-credentials/libwebauthn) project.
-3. The CTAP2 request bytes are forwarded **unchanged** to the phone, which
-   prompts for biometrics and returns the assertion / attestation. Those bytes
-   go back to Firefox unchanged. pocketkey never sees or stores a private key.
+3. The CTAP2 request is forwarded to the phone, which prompts for biometrics
+   and returns the assertion / attestation. The response bytes go back to
+   Firefox unchanged. The only change made to a request is re-encoding its
+   CBOR in canonical key order: Firefox writes some maps out of order and
+   Android's hybrid authenticator rejects those outright; values such as
+   `clientDataHash` and credential ids are preserved exactly. pocketkey never
+   sees or stores a private key.
 4. The phone sends linking data after a QR session; pocketkey stores it so the
    next request needs no QR. Several phones can be linked.
 

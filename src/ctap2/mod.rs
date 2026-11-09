@@ -7,6 +7,7 @@
 //! and `getAssertion` to the phone byte-for-byte via the [`crate::hybrid`]
 //! module.
 
+pub mod canonical;
 pub mod preflight;
 
 use std::collections::VecDeque;
@@ -56,8 +57,8 @@ pub const MAX_MSG_SIZE: u64 = 2048;
 pub enum Disposition {
     /// Answer immediately with these bytes (`status ++ cbor`).
     Respond(Vec<u8>),
-    /// Forward the whole payload (`cmd ++ cbor`) to the phone.
-    Forward { hint: Hint },
+    /// Forward this payload (`cmd ++ cbor`, canonically re-encoded) to the phone.
+    Forward { hint: Hint, frame: Vec<u8> },
 }
 
 /// Per-device CTAP2 state: the only state is the queue of synthetic
@@ -88,10 +89,12 @@ impl Ctap2 {
             command::GET_INFO => Disposition::Respond(get_info_response()),
             command::MAKE_CREDENTIAL => Disposition::Forward {
                 hint: Hint::MakeCredential,
+                frame: forwardable(cmd, cbor),
             },
             command::GET_ASSERTION => match preflight::inspect(cbor) {
                 preflight::Probe::NotSilent => Disposition::Forward {
                     hint: Hint::GetAssertion,
+                    frame: forwardable(cmd, cbor),
                 },
                 preflight::Probe::Error(code) => Disposition::Respond(vec![code]),
                 preflight::Probe::Assertions(mut responses) => {
@@ -119,6 +122,25 @@ impl Ctap2 {
             _ => Disposition::Respond(vec![status::CTAP1_ERR_INVALID_COMMAND]),
         }
     }
+}
+
+/// `cmd ++ cbor` with the CBOR in canonical key order (see [`canonical`]).
+/// Falls back to the original bytes if they do not decode; the phone will
+/// then produce the error itself.
+fn forwardable(cmd: u8, cbor: &[u8]) -> Vec<u8> {
+    let body = match canonical::canonicalize(cbor) {
+        Some(canonical) => {
+            if canonical != cbor {
+                tracing::debug!("re-encoded request CBOR in canonical key order");
+            }
+            canonical
+        }
+        None => cbor.to_vec(),
+    };
+    let mut frame = Vec::with_capacity(1 + body.len());
+    frame.push(cmd);
+    frame.extend_from_slice(&body);
+    frame
 }
 
 /// `authenticatorGetInfo` response, `0x00 ++ cbor`.
@@ -242,13 +264,23 @@ mod tests {
         assert_eq!(
             dispatch(&[command::MAKE_CREDENTIAL, 0xA0]),
             Disposition::Forward {
-                hint: Hint::MakeCredential
+                hint: Hint::MakeCredential,
+                frame: vec![command::MAKE_CREDENTIAL, 0xA0]
             }
         );
         assert_eq!(
             dispatch(&[command::GET_ASSERTION, 0xA0]),
             Disposition::Forward {
-                hint: Hint::GetAssertion
+                hint: Hint::GetAssertion,
+                frame: vec![command::GET_ASSERTION, 0xA0]
+            }
+        );
+        // Undecodable CBOR is forwarded untouched.
+        assert_eq!(
+            dispatch(&[command::MAKE_CREDENTIAL, 0xFF]),
+            Disposition::Forward {
+                hint: Hint::MakeCredential,
+                frame: vec![command::MAKE_CREDENTIAL, 0xFF]
             }
         );
         assert_eq!(

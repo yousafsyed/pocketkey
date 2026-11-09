@@ -242,7 +242,7 @@ fn handle_event(
             );
             match ctap.dispatch(&payload) {
                 ctap2::Disposition::Respond(bytes) => send_all(device, &hid.respond(id, &bytes))?,
-                ctap2::Disposition::Forward { hint } => {
+                ctap2::Disposition::Forward { hint, frame } => {
                     if active.is_some() {
                         // ctaphid serialises requests, so this cannot happen; be defensive.
                         error!("forwarded request while another is active");
@@ -255,7 +255,7 @@ fn handle_event(
                         let transport = Arc::clone(transport);
                         let cancel = cancel.clone();
                         let status_tx = status_tx.clone();
-                        async move { transport.ctap(payload, hint, status_tx, cancel).await }
+                        async move { transport.ctap(frame, hint, status_tx, cancel).await }
                     });
                     *active = Some(Active { id, task, cancel });
                 }
