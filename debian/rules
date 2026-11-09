@@ -1,0 +1,23 @@
+#!/usr/bin/make -f
+# Builds with cargo directly. Network access is needed for crates (the
+# hybrid transport is pinned to a git tag), so this is for local
+# dpkg-buildpackage runs, not for an offline archive build.
+export CARGO_HOME = $(CURDIR)/debian/cargo_home
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_test:
+	cargo test --release --locked
+
+override_dh_auto_install:
+	install -Dm755 target/release/pocketkey debian/pocketkey/usr/bin/pocketkey
+	install -Dm644 packaging/99-pocketkey.rules debian/pocketkey/usr/lib/udev/rules.d/99-pocketkey.rules
+	install -Dm644 packaging/pocketkey.service debian/pocketkey/usr/lib/systemd/user/pocketkey.service
+
+override_dh_auto_clean:
+	cargo clean
+	rm -rf debian/cargo_home

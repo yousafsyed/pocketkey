@@ -1,0 +1,7 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: pocketkey
+Source: https://github.com/yousafsyed/pocketkey
+
+Files: *
+Copyright: 2026 Yousaf Syed
+License: MIT or Apache-2.0

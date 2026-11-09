@@ -1,0 +1,19 @@
+Source: pocketkey
+Section: utils
+Priority: optional
+Maintainer: Yousaf Syed <yousaf@automatiq.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.88), pkg-config, libdbus-1-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/yousafsyed/pocketkey
+Rules-Requires-Root: no
+
+Package: pocketkey
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, bluez, udev
+Recommends: fido2-tools
+Description: virtual FIDO2 security key backed by your phone (WebAuthn hybrid)
+ pocketkey presents a virtual USB FIDO2 security key to the system via
+ /dev/uhid and fulfils CTAP2 requests by proxying them to a phone over the
+ WebAuthn hybrid transport (QR code, Bluetooth LE proximity, encrypted
+ tunnel). It lets browsers without hybrid support on Linux, such as
+ Firefox, use passkeys stored on an Android phone or iPhone.
