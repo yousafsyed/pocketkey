@@ -2,14 +2,20 @@ Source: pocketkey
 Section: utils
 Priority: optional
 Maintainer: Yousaf Syed <yousaf@automatiq.com>
-Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.88), pkg-config, libdbus-1-dev
+# A Rust toolchain >= 1.88 (rustup) is required as well; Ubuntu's rustc is too
+# old, so it is not listed and builds use `dpkg-buildpackage -d`.
+Build-Depends: debhelper-compat (= 13), pkg-config, libdbus-1-dev
 Standards-Version: 4.6.2
 Homepage: https://github.com/yousafsyed/pocketkey
 Rules-Requires-Root: no
 
 Package: pocketkey
 Architecture: amd64
-Depends: ${shlibs:Depends}, ${misc:Depends}, bluez, udev
+# The window toolkit loads its graphics/display libraries at runtime (dlopen),
+# so dpkg-shlibdeps cannot see them; list them explicitly.
+Depends: ${shlibs:Depends}, ${misc:Depends}, bluez, udev,
+ libxkbcommon0, libegl1, libgl1, libwayland-client0, libwayland-egl1,
+ libx11-6, libxcursor1, libxi6, libxrandr2
 Recommends: fido2-tools
 Description: virtual FIDO2 security key backed by your phone (WebAuthn hybrid)
  pocketkey presents a virtual USB FIDO2 security key to the system via

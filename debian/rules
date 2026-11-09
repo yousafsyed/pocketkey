@@ -3,21 +3,27 @@
 # hybrid transport is pinned to a git tag), so this is for local
 # dpkg-buildpackage runs, not for an offline archive build.
 export CARGO_HOME = $(CURDIR)/debian/cargo_home
+# Extra cargo flags, e.g. DEB_CARGO_FLAGS="--features vendored-dbus" on a
+# machine without libdbus-1-dev.
+DEB_CARGO_FLAGS ?=
 
 %:
 	dh $@
 
 override_dh_auto_build:
-	cargo build --release --locked
+	cargo build --release --locked $(DEB_CARGO_FLAGS)
 
 override_dh_auto_test:
-	cargo test --release --locked
+	cargo test --release --locked $(DEB_CARGO_FLAGS)
 
 override_dh_auto_install:
 	install -Dm755 target/release/pocketkey debian/pocketkey/usr/bin/pocketkey
 	install -Dm644 packaging/60-pocketkey.rules debian/pocketkey/usr/lib/udev/rules.d/60-pocketkey.rules
 	install -Dm644 packaging/pocketkey-modules.conf debian/pocketkey/usr/lib/modules-load.d/pocketkey.conf
 	install -Dm644 packaging/pocketkey.service debian/pocketkey/usr/lib/systemd/user/pocketkey.service
+	# Enabled for every user out of the box; starts at the next login.
+	install -d debian/pocketkey/usr/lib/systemd/user/default.target.wants
+	ln -s ../pocketkey.service debian/pocketkey/usr/lib/systemd/user/default.target.wants/pocketkey.service
 
 override_dh_auto_clean:
 	cargo clean

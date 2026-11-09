@@ -70,8 +70,19 @@ sudo make install        # /usr/local/bin/pocketkey + udev rule for /dev/uhid
 make install-user        # systemd user service, enabled and started
 ```
 
-Or build a `.deb`: `make deb` (needs `devscripts`, `debhelper`, `cargo`), then
-`sudo apt install ../pocketkey_*.deb` and `systemctl --user enable --now pocketkey`.
+Or install the `.deb` from the [latest release](https://github.com/yousafsyed/pocketkey/releases/latest)
+(built on Ubuntu 24.04, works on 24.04 and newer):
+
+```sh
+sudo apt install ./pocketkey_*_amd64.deb
+systemctl --user start pocketkey      # starts automatically at your next login
+```
+
+To build the package yourself: `make deb` (needs `debhelper`, `dpkg-dev`,
+`libdbus-1-dev` and a rustup toolchain ≥ 1.88); the result lands in the
+parent directory. Releases are automated: every push to `main` bumps the
+version from the commit messages (`feat:` → minor, `feat!:`/`BREAKING CHANGE`
+→ major, otherwise patch), tags it, and publishes the `.deb` on GitHub.
 
 On a machine without `libdbus-1-dev`, `cargo build --features vendored-dbus`
 compiles libdbus from source instead.

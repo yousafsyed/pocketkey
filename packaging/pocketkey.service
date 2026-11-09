@@ -9,7 +9,7 @@ Type=simple
 ExecStart=/usr/bin/pocketkey
 Restart=on-failure
 RestartSec=2
-Environment=RUST_LOG=info,pocketkey=debug,pxp=debug
+Environment=RUST_LOG=info
 # Keep the window on the user's display.
 PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
 

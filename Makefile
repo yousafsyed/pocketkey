@@ -61,4 +61,4 @@ uninstall-user:
 	systemctl --user daemon-reload
 
 deb:
-	dpkg-buildpackage -us -uc -b
+	dpkg-buildpackage -us -uc -b -d

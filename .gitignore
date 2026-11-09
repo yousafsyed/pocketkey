@@ -2,3 +2,11 @@
 *.deb
 *.buildinfo
 *.changes
+/dist/
+/debian/.debhelper/
+/debian/cargo_home/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/pocketkey/
+/debian/pocketkey.substvars
+/debian/pocketkey.*.debhelper
