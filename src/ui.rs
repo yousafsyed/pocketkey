@@ -19,6 +19,8 @@ use tracing::warn;
 use crate::hybrid::Status;
 
 const WINDOW_SIZE: [f32; 2] = [380.0, 560.0];
+const CORNER_RADIUS: f32 = 12.0;
+const HEADER_HEIGHT: f32 = 46.0;
 const QR_PIXELS: f32 = 272.0;
 /// How long the window stays after a successful request.
 const DONE_LINGER: Duration = Duration::from_millis(1200);
@@ -36,7 +38,13 @@ pub fn show(
             .with_app_id("pocketkey")
             .with_inner_size(WINDOW_SIZE)
             .with_min_inner_size(WINDOW_SIZE)
-            .with_resizable(false),
+            .with_resizable(false)
+            // GNOME draws no title bar for non-GTK windows on Wayland and the
+            // toolkit's imitation looks foreign, so the dialog draws its own
+            // header (see `draw_header`). Transparent so the corners can be
+            // rounded like a native dialog.
+            .with_decorations(false)
+            .with_transparent(true),
         centered: true,
         ..Default::default()
     };
@@ -157,7 +165,7 @@ impl eframe::App for App {
         // Poll the daemon's status; cheap, and avoids cross-thread wakeups.
         ctx.request_repaint_after(Duration::from_millis(100));
 
-        if ctx.input(|i| i.viewport().close_requested()) {
+        if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
             // Closing the window cancels the request; the window then goes away.
             self.cancel();
         }
@@ -198,17 +206,27 @@ impl eframe::App for App {
 
         let palette = Palette::from(ctx.style().visuals.dark_mode);
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(palette.background).inner_margin(egui::Margin::symmetric(28, 24)))
+            .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
+                let card = ui.max_rect();
+                ui.painter().rect(
+                    card,
+                    CORNER_RADIUS,
+                    palette.background,
+                    egui::Stroke::new(1.0_f32, palette.border),
+                    egui::StrokeKind::Inside,
+                );
+                if draw_header(ui, &palette, card) {
+                    self.cancel();
+                }
+                let content = egui::Rect::from_min_max(
+                    card.min + egui::vec2(28.0, HEADER_HEIGHT + 4.0),
+                    card.max - egui::vec2(28.0, 24.0),
+                );
+                let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(content));
+                let ui = &mut ui;
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new("POCKETKEY")
-                            .size(11.0)
-                            .color(palette.muted)
-                            .extra_letter_spacing(2.0),
-                    );
-                    ui.add_space(6.0);
 
                     let (headline, body, show_cancel) = match &shown {
                         Status::ShowQr { payload } => {
@@ -322,6 +340,9 @@ struct Palette {
     danger: Color32,
     button: Color32,
     button_border: Color32,
+    border: Color32,
+    close_button: Color32,
+    close_button_hover: Color32,
 }
 
 impl Palette {
@@ -336,6 +357,9 @@ impl Palette {
                 danger: Color32::from_rgb(0xe5, 0x53, 0x5a),
                 button: Color32::from_rgb(0x2b, 0x2d, 0x34),
                 button_border: Color32::from_rgb(0x3d, 0x40, 0x49),
+                border: Color32::from_rgb(0x3a, 0x3c, 0x44),
+                close_button: Color32::from_rgb(0x34, 0x36, 0x3e),
+                close_button_hover: Color32::from_rgb(0x46, 0x49, 0x52),
             }
         } else {
             Self {
@@ -347,6 +371,9 @@ impl Palette {
                 danger: Color32::from_rgb(0xd9, 0x30, 0x25),
                 button: Color32::WHITE,
                 button_border: Color32::from_rgb(0xd0, 0xd3, 0xd9),
+                border: Color32::from_rgb(0xd6, 0xd8, 0xde),
+                close_button: Color32::from_rgb(0xe6, 0xe7, 0xeb),
+                close_button_hover: Color32::from_rgb(0xd4, 0xd6, 0xdc),
             }
         }
     }
@@ -355,6 +382,49 @@ impl Palette {
 enum Glyph {
     Check,
     Cross,
+}
+
+/// Header bar replacing the window decorations: wordmark on the left, a
+/// GNOME-style round close button on the right, draggable to move the
+/// window. Returns true when the close button was clicked.
+fn draw_header(ui: &mut egui::Ui, palette: &Palette, card: egui::Rect) -> bool {
+    let header = egui::Rect::from_min_size(card.min, egui::vec2(card.width(), HEADER_HEIGHT));
+    let drag = ui.interact(header, ui.id().with("header-drag"), egui::Sense::drag());
+    if drag.drag_started() {
+        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+    }
+
+    let painter = ui.painter();
+    painter.text(
+        egui::pos2(header.min.x + 20.0, header.center().y),
+        egui::Align2::LEFT_CENTER,
+        "POCKETKEY",
+        egui::FontId::proportional(11.0),
+        palette.muted,
+    );
+
+    let button_rect = egui::Rect::from_center_size(
+        egui::pos2(header.max.x - 12.0 - 12.0, header.center().y),
+        egui::vec2(24.0, 24.0),
+    );
+    let button = ui.interact(button_rect, ui.id().with("close"), egui::Sense::click());
+    let fill = if button.hovered() {
+        palette.close_button_hover
+    } else {
+        palette.close_button
+    };
+    painter.circle_filled(button_rect.center(), 12.0, fill);
+    let c = button_rect.center();
+    let stroke = egui::Stroke::new(1.6_f32, palette.text);
+    painter.line_segment(
+        [c + egui::vec2(-4.0, -4.0), c + egui::vec2(4.0, 4.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [c + egui::vec2(-4.0, 4.0), c + egui::vec2(4.0, -4.0)],
+        stroke,
+    );
+    button.on_hover_text("Cancel").clicked()
 }
 
 /// A phone outline drawn with the painter, optionally with a spinner on screen.
