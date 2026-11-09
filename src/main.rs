@@ -56,8 +56,11 @@ fn main() -> anyhow::Result<()> {
     info!(path = %store_path.display(), linked_phones = store.list().len(), "linked device store");
     let transport: Arc<dyn HybridTransport> = Arc::new(PxpTransport::new(store));
 
-    // Create the device before anything else so permission problems surface immediately.
-    let device = UhidDevice::create().context("creating the virtual FIDO device")?;
+    // Create the device before anything else so permission problems surface
+    // immediately. Must run inside the runtime: AsyncFd registers with it.
+    let device = runtime
+        .block_on(async { UhidDevice::create() })
+        .context("creating the virtual FIDO device")?;
     info!(name = uhid::DEVICE_NAME, "virtual FIDO2 key ready");
 
     let (status_tx, status_rx) = watch::channel(Status::Idle);
@@ -78,7 +81,8 @@ fn main() -> anyhow::Result<()> {
                 tokio::select! {
                     res = &mut daemon => return Some(res),
                     changed = ui_status.changed() => {
-                        if changed.is_err() { return None; }
+                        // The sender lives in the daemon task; a closed channel means it is exiting.
+                        if changed.is_err() { return Some((&mut daemon).await); }
                         if !matches!(*ui_status.borrow_and_update(), Status::Idle) { return None; }
                     }
                 }
@@ -99,7 +103,7 @@ fn main() -> anyhow::Result<()> {
                 tokio::select! {
                     res = &mut daemon => return Some(res),
                     changed = ui_status.changed() => {
-                        if changed.is_err() { return None; }
+                        if changed.is_err() { return Some((&mut daemon).await); }
                         if matches!(*ui_status.borrow_and_update(), Status::Idle) { return None; }
                     }
                 }
