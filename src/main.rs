@@ -141,6 +141,7 @@ async fn event_loop(
     ui_cancel_rx: &mut mpsc::UnboundedReceiver<()>,
 ) -> anyhow::Result<()> {
     let mut hid = ctaphid::Transport::new().with_version(crate_version_bytes());
+    let mut ctap = ctap2::Ctap2::new();
     let mut ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
@@ -154,7 +155,7 @@ async fn event_loop(
                         let out = hid.handle_report(&report, Instant::now());
                         send_all(device, &out.reports)?;
                         for ev in out.events {
-                            handle_event(ev, &mut hid, &mut active, &transport, status_tx, device)?;
+                            handle_event(ev, &mut hid, &mut ctap, &mut active, &transport, status_tx, device)?;
                         }
                     }
                     UhidEvent::Open => debug!("hidraw node opened by a client"),
@@ -222,9 +223,11 @@ async fn event_loop(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_event(
     ev: Event,
     hid: &mut ctaphid::Transport,
+    ctap: &mut ctap2::Ctap2,
     active: &mut Option<Active>,
     transport: &Arc<dyn HybridTransport>,
     status_tx: &watch::Sender<Status>,
@@ -237,7 +240,7 @@ fn handle_event(
                 len = payload.len(),
                 "CTAP2 request"
             );
-            match ctap2::dispatch(&payload) {
+            match ctap.dispatch(&payload) {
                 ctap2::Disposition::Respond(bytes) => send_all(device, &hid.respond(id, &bytes))?,
                 ctap2::Disposition::Forward { hint } => {
                     if active.is_some() {

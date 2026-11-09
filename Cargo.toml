@@ -12,6 +12,8 @@ tokio = { version = "1.45", features = ["rt-multi-thread", "macros", "sync", "ti
 tokio-util = { version = "0.7", features = ["rt"] }
 libc = "0.2"
 ciborium = "0.2"
+# rpIdHash for the local pre-flight answer; already a pxp dependency.
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"

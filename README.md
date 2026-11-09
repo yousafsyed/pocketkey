@@ -111,13 +111,17 @@ Cancel from the window, from Firefox's dialog, or on the phone.
 
 ## Limitations
 
-- **allowList pre-flight in Firefox.** Firefox probes security keys with a
-  silent `getAssertion` (`up: false`) when a site supplies an allowList.
-  Phones cannot answer silently, so the probe is forwarded as a normal request
-  and the phone prompts twice on such sites. Passkey (discoverable credential)
-  logins, the common case, prompt once.
+- **Firefox pre-flight is answered locally.** When a site supplies an
+  allowList (or excludeList), Firefox first sends a *silent* `getAssertion`
+  (`up: false`) to learn which of those credentials the key holds, and gives
+  up if none are confirmed. A phone cannot answer silent requests, so
+  pocketkey confirms every credential the site listed (placeholder authData,
+  empty signature, nothing signed or invented) and the phone then decides on
+  the real request. Consequence: if none of the listed credentials is on your
+  phone, you find out on the phone instead of Firefox saying so up front.
 - No U2F/CTAP1, no PIN, no credential management, no NFC. `getNextAssertion`
-  returns `CTAP2_ERR_NOT_ALLOWED` (phones return a single assertion).
+  is only served for the local pre-flight answer above; phones return a
+  single assertion.
 - Only the cloud-assisted tunnel (caBLE v2) is advertised in the QR for
   compatibility with current Android builds; direct BLE L2CAP is not used.
 

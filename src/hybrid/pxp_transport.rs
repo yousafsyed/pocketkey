@@ -24,7 +24,6 @@ use tracing::{debug, info, warn};
 
 use super::store::FileStore;
 use super::{Hint, HybridError, HybridTransport, Status};
-use crate::ctap2::command;
 
 /// How long the QR code stays valid before the request fails. Browsers
 /// usually cancel sooner (their own WebAuthn timeout); this is the backstop.
@@ -125,13 +124,6 @@ impl HybridTransport for PxpTransport {
         status: watch::Sender<Status>,
         cancel: CancellationToken,
     ) -> Result<Vec<u8>, HybridError> {
-        // getNextAssertion needs the tunnel of the previous getAssertion, which
-        // we close as soon as its response arrives; phones answer with a single
-        // assertion anyway. Tell the client to stop asking.
-        if frame.first() == Some(&command::GET_NEXT_ASSERTION) {
-            return Err(HybridError::NotAllowed);
-        }
-
         let result = self.run(frame, hint, &status, &cancel).await;
         let _ = status.send(match &result {
             Ok(_) => Status::Done,

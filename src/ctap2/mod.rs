@@ -2,9 +2,14 @@
 //!
 //! The payload of a CTAPHID_CBOR request is `command_byte ++ cbor_map`; the
 //! response is `status_byte ++ cbor_map`. We answer `authenticatorGetInfo`,
-//! `authenticatorSelection` and `authenticatorReset` locally and forward
-//! `makeCredential`, `getAssertion` and `getNextAssertion` to the phone
-//! byte-for-byte via the [`crate::hybrid`] module.
+//! `authenticatorSelection`, `authenticatorReset` and Firefox's silent
+//! pre-flight probes (see [`preflight`]) locally, and forward `makeCredential`
+//! and `getAssertion` to the phone byte-for-byte via the [`crate::hybrid`]
+//! module.
+
+pub mod preflight;
+
+use std::collections::VecDeque;
 
 use ciborium::Value;
 
@@ -27,9 +32,12 @@ pub mod status {
     pub const OK: u8 = 0x00;
     pub const CTAP1_ERR_INVALID_COMMAND: u8 = 0x01;
     pub const CTAP1_ERR_INVALID_LENGTH: u8 = 0x03;
+    pub const CTAP2_ERR_INVALID_CBOR: u8 = 0x12;
+    pub const CTAP2_ERR_MISSING_PARAMETER: u8 = 0x14;
     pub const CTAP2_ERR_OPERATION_DENIED: u8 = 0x27;
     pub const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
     pub const CTAP2_ERR_USER_ACTION_TIMEOUT: u8 = 0x2F;
+    pub const CTAP2_ERR_NO_CREDENTIALS: u8 = 0x2E;
     pub const CTAP2_ERR_NOT_ALLOWED: u8 = 0x30;
     pub const CTAP2_ERR_REQUEST_TOO_LARGE: u8 = 0x39;
     pub const CTAP1_ERR_OTHER: u8 = 0x7F;
@@ -52,29 +60,64 @@ pub enum Disposition {
     Forward { hint: Hint },
 }
 
-/// Decide how a CTAPHID_CBOR payload is handled.
-pub fn dispatch(payload: &[u8]) -> Disposition {
-    let Some((&cmd, _cbor)) = payload.split_first() else {
-        return Disposition::Respond(vec![status::CTAP1_ERR_INVALID_LENGTH]);
-    };
-    if payload.len() > MAX_MSG_SIZE as usize {
-        return Disposition::Respond(vec![status::CTAP2_ERR_REQUEST_TOO_LARGE]);
+/// Per-device CTAP2 state: the only state is the queue of synthetic
+/// assertions left to serve through `getNextAssertion` after a pre-flight.
+#[derive(Debug, Default)]
+pub struct Ctap2 {
+    pending_assertions: VecDeque<Vec<u8>>,
+}
+
+impl Ctap2 {
+    pub fn new() -> Self {
+        Self::default()
     }
-    match cmd {
-        command::GET_INFO => Disposition::Respond(get_info_response()),
-        command::MAKE_CREDENTIAL => Disposition::Forward {
-            hint: Hint::MakeCredential,
-        },
-        command::GET_ASSERTION | command::GET_NEXT_ASSERTION => Disposition::Forward {
-            hint: Hint::GetAssertion,
-        },
-        // We are the only "key" the client can pick, so selection succeeds at once.
-        command::SELECTION => Disposition::Respond(vec![status::OK]),
-        command::RESET => Disposition::Respond(vec![status::CTAP2_ERR_NOT_ALLOWED]),
-        // No PIN support is advertised; a client that asks anyway gets the
-        // same answer a PIN-less key would give for an unsupported command.
-        command::CLIENT_PIN => Disposition::Respond(vec![status::CTAP1_ERR_INVALID_COMMAND]),
-        _ => Disposition::Respond(vec![status::CTAP1_ERR_INVALID_COMMAND]),
+
+    /// Decide how a CTAPHID_CBOR payload is handled.
+    pub fn dispatch(&mut self, payload: &[u8]) -> Disposition {
+        let Some((&cmd, cbor)) = payload.split_first() else {
+            return Disposition::Respond(vec![status::CTAP1_ERR_INVALID_LENGTH]);
+        };
+        if payload.len() > MAX_MSG_SIZE as usize {
+            return Disposition::Respond(vec![status::CTAP2_ERR_REQUEST_TOO_LARGE]);
+        }
+        // Any command other than getNextAssertion ends a pre-flight sequence.
+        if cmd != command::GET_NEXT_ASSERTION {
+            self.pending_assertions.clear();
+        }
+        match cmd {
+            command::GET_INFO => Disposition::Respond(get_info_response()),
+            command::MAKE_CREDENTIAL => Disposition::Forward {
+                hint: Hint::MakeCredential,
+            },
+            command::GET_ASSERTION => match preflight::inspect(cbor) {
+                preflight::Probe::NotSilent => Disposition::Forward {
+                    hint: Hint::GetAssertion,
+                },
+                preflight::Probe::Error(code) => Disposition::Respond(vec![code]),
+                preflight::Probe::Assertions(mut responses) => {
+                    let first = responses.remove(0);
+                    tracing::info!(
+                        credentials = responses.len() + 1,
+                        "answering silent pre-flight getAssertion locally"
+                    );
+                    self.pending_assertions = responses.into();
+                    Disposition::Respond(first)
+                }
+            },
+            // Phones return a single assertion, so the only getNextAssertion we
+            // ever serve is the continuation of a local pre-flight answer.
+            command::GET_NEXT_ASSERTION => match self.pending_assertions.pop_front() {
+                Some(response) => Disposition::Respond(response),
+                None => Disposition::Respond(vec![status::CTAP2_ERR_NOT_ALLOWED]),
+            },
+            // We are the only "key" the client can pick, so selection succeeds at once.
+            command::SELECTION => Disposition::Respond(vec![status::OK]),
+            command::RESET => Disposition::Respond(vec![status::CTAP2_ERR_NOT_ALLOWED]),
+            // No PIN support is advertised; a client that asks anyway gets the
+            // same answer a PIN-less key would give for an unsupported command.
+            command::CLIENT_PIN => Disposition::Respond(vec![status::CTAP1_ERR_INVALID_COMMAND]),
+            _ => Disposition::Respond(vec![status::CTAP1_ERR_INVALID_COMMAND]),
+        }
     }
 }
 
@@ -150,6 +193,10 @@ mod tests {
             .map(|(_, v)| v)
     }
 
+    fn dispatch(payload: &[u8]) -> Disposition {
+        Ctap2::new().dispatch(payload)
+    }
+
     #[test]
     fn get_info_is_answered_locally_and_well_formed() {
         let Disposition::Respond(resp) = dispatch(&[command::GET_INFO]) else {
@@ -206,9 +253,58 @@ mod tests {
         );
         assert_eq!(
             dispatch(&[command::GET_NEXT_ASSERTION]),
-            Disposition::Forward {
-                hint: Hint::GetAssertion
-            }
+            Disposition::Respond(vec![status::CTAP2_ERR_NOT_ALLOWED]),
+            "no pre-flight in progress"
+        );
+    }
+
+    #[test]
+    fn silent_preflight_is_served_locally_with_get_next_assertion() {
+        let allow: Vec<Value> = ["a", "b"]
+            .iter()
+            .map(|id| {
+                Value::Map(vec![
+                    (
+                        Value::Text("id".into()),
+                        Value::Bytes(id.as_bytes().to_vec()),
+                    ),
+                    (Value::Text("type".into()), Value::Text("public-key".into())),
+                ])
+            })
+            .collect();
+        let req = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Text("example.com".into())),
+            (Value::Integer(2.into()), Value::Bytes(vec![0; 32])),
+            (Value::Integer(3.into()), Value::Array(allow)),
+            (
+                Value::Integer(5.into()),
+                Value::Map(vec![(Value::Text("up".into()), Value::Bool(false))]),
+            ),
+        ]);
+        let mut payload = vec![command::GET_ASSERTION];
+        ciborium::into_writer(&req, &mut payload).unwrap();
+
+        let mut ctap = Ctap2::new();
+        let Disposition::Respond(first) = ctap.dispatch(&payload) else {
+            panic!("must be local")
+        };
+        assert_eq!(first[0], status::OK);
+        let Disposition::Respond(second) = ctap.dispatch(&[command::GET_NEXT_ASSERTION]) else {
+            panic!()
+        };
+        assert_eq!(second[0], status::OK);
+        assert_ne!(first, second);
+        assert_eq!(
+            ctap.dispatch(&[command::GET_NEXT_ASSERTION]),
+            Disposition::Respond(vec![status::CTAP2_ERR_NOT_ALLOWED]),
+            "queue exhausted"
+        );
+        // A new pre-flight followed by an unrelated command drops the queue.
+        ctap.dispatch(&payload);
+        ctap.dispatch(&[command::GET_INFO]);
+        assert_eq!(
+            ctap.dispatch(&[command::GET_NEXT_ASSERTION]),
+            Disposition::Respond(vec![status::CTAP2_ERR_NOT_ALLOWED])
         );
     }
 
