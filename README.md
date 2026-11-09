@@ -41,8 +41,9 @@ Firefox ──hidraw──▶ /dev/uhid ──▶ pocketkey ──BLE + wss tunn
    Android's hybrid authenticator rejects those outright; values such as
    `clientDataHash` and credential ids are preserved exactly. pocketkey never
    sees or stores a private key.
-4. The phone sends linking data after a QR session; pocketkey stores it so the
-   next request needs no QR. Several phones can be linked.
+4. If the phone sends linking data after a QR session, pocketkey stores it so
+   the next request needs no QR. Several phones can be linked. (Current
+   Android/Google Password Manager phones do not send it; see "Use".)
 
 ## Requirements
 
@@ -90,8 +91,11 @@ different device" if asked. The pocketkey window appears:
 
 - **First time:** scan the QR code with the phone's camera, approve on the
   phone. The phone is now linked.
-- **Afterwards:** the phone gets a notification; approve there. If the phone
-  does not answer within 10 seconds, the QR code appears as a fallback.
+- **Afterwards:** if the phone sent linking data, it gets a notification
+  instead and the QR is only a fallback after 10 seconds. **Android with
+  Google Password Manager currently does not send linking data** (Google
+  retired phone linking in 2024 in favour of passkey sync), so expect a QR
+  code every time with such phones.
 
 Cancel from the window, from Firefox's dialog, or on the phone.
 

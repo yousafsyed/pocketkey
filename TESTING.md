@@ -45,6 +45,11 @@ the phone first). Watch logs in a second terminal:
 
 ## M5: linking
 
+Observed 2026-11-09 with a Fairphone / Google Password Manager: the phone
+sends **no** linking update after the handshake even though the QR advertises
+state-assisted support, so 5.1–5.5 cannot pass with that phone. The code path
+is kept for phones that do send linking data; the tests below apply to those.
+
 | # | Step | Expect |
 |---|------|--------|
 | 5.1 | After any successful QR session: `ls -l ~/.local/share/pocketkey/` | `linked_devices.cbor` mode `-rw-------`; log `phone linked` |
