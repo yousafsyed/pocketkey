@@ -8,6 +8,7 @@
 //! module.
 
 pub mod canonical;
+pub mod describe;
 pub mod preflight;
 
 use std::collections::VecDeque;

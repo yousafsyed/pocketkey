@@ -195,6 +195,7 @@ async fn event_loop(
                 let payload = match result {
                     Ok(Ok(bytes)) => {
                         info!(status = bytes.first().copied().unwrap_or(0), "phone replied");
+                        ctap2::describe::log_response(&bytes);
                         bytes
                     }
                     Ok(Err(e)) => {
