@@ -88,15 +88,21 @@ impl Ctap2 {
         }
         match cmd {
             command::GET_INFO => Disposition::Respond(get_info_response()),
-            command::MAKE_CREDENTIAL => Disposition::Forward {
-                hint: Hint::MakeCredential,
-                frame: forwardable(cmd, cbor),
-            },
-            command::GET_ASSERTION => match preflight::inspect(cbor) {
-                preflight::Probe::NotSilent => Disposition::Forward {
-                    hint: Hint::GetAssertion,
+            command::MAKE_CREDENTIAL => {
+                describe::log_make_credential_request(cbor);
+                Disposition::Forward {
+                    hint: Hint::MakeCredential,
                     frame: forwardable(cmd, cbor),
-                },
+                }
+            }
+            command::GET_ASSERTION => match preflight::inspect(cbor) {
+                preflight::Probe::NotSilent => {
+                    describe::trace_get_assertion_request(cbor);
+                    Disposition::Forward {
+                        hint: Hint::GetAssertion,
+                        frame: forwardable(cmd, cbor),
+                    }
+                }
                 preflight::Probe::Error(code) => Disposition::Respond(vec![code]),
                 preflight::Probe::Assertions(mut responses) => {
                     let first = responses.remove(0);
