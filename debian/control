@@ -1,7 +1,7 @@
 Source: pocketkey
 Section: utils
 Priority: optional
-Maintainer: Yousaf Syed <yousaf@automatiq.com>
+Maintainer: S. Yousaf Ali <yousaf@automatiq.com>
 # A Rust toolchain >= 1.88 (rustup) is required as well; Ubuntu's rustc is too
 # old, so it is not listed and builds use `dpkg-buildpackage -d`.
 Build-Depends: debhelper-compat (= 13), pkg-config, libdbus-1-dev

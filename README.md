@@ -183,7 +183,7 @@ state machine), `src/ctap2.rs` (command dispatch and getInfo),
 
 ## License
 
-Copyright (c) 2026 Yousaf Syed.
+Copyright (c) 2026 S. Yousaf Ali.
 
 Licensed under either of
 

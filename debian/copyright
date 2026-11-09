@@ -1,10 +1,10 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: pocketkey
-Upstream-Contact: Yousaf Syed <yousafsyed@icloud.com>
+Upstream-Contact: S. Yousaf Ali <yousafsyed@icloud.com>
 Source: https://github.com/yousafsyed/pocketkey
 
 Files: *
-Copyright: 2026 Yousaf Syed
+Copyright: 2026 S. Yousaf Ali
 License: MIT or Apache-2.0
  This software is dual licensed; use it under either license at your option.
  The full texts ship as LICENSE-MIT and LICENSE-APACHE in the source tree.
