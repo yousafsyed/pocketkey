@@ -8,6 +8,7 @@
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 UDEV_RULES_DIR ?= /etc/udev/rules.d
+MODULES_LOAD_DIR ?= /etc/modules-load.d
 USER_UNIT_DIR ?= $(HOME)/.config/systemd/user
 FEATURES ?=
 CARGO ?= cargo
@@ -33,9 +34,13 @@ install:
 	@test -x target/release/pocketkey || { echo "target/release/pocketkey not found; run 'make build' first"; exit 1; }
 	install -Dm755 target/release/pocketkey $(DESTDIR)$(BINDIR)/pocketkey
 	install -Dm644 packaging/99-pocketkey.rules $(DESTDIR)$(UDEV_RULES_DIR)/99-pocketkey.rules
+	install -Dm644 packaging/pocketkey-modules.conf $(DESTDIR)$(MODULES_LOAD_DIR)/pocketkey.conf
 	@if [ -z "$(DESTDIR)" ]; then \
-		udevadm control --reload && udevadm trigger --name-match=uhid; \
-		echo "udev rule installed; /dev/uhid ACL: $$(getfacl -p /dev/uhid 2>/dev/null | grep '^user:' | tr '\n' ' ')"; \
+		udevadm control --reload; \
+		modprobe uhid; \
+		udevadm trigger --action=add /sys/class/misc/uhid; \
+		udevadm settle; \
+		echo "/dev/uhid ACL: $$(getfacl -p /dev/uhid 2>/dev/null | grep '^user:' | tr '\n' ' ')"; \
 	fi
 
 install-user:
@@ -46,7 +51,7 @@ install-user:
 	systemctl --user --no-pager status pocketkey.service || true
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/pocketkey $(DESTDIR)$(UDEV_RULES_DIR)/99-pocketkey.rules
+	rm -f $(DESTDIR)$(BINDIR)/pocketkey $(DESTDIR)$(UDEV_RULES_DIR)/99-pocketkey.rules $(DESTDIR)$(MODULES_LOAD_DIR)/pocketkey.conf
 	-udevadm control --reload
 
 uninstall-user:

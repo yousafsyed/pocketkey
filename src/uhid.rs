@@ -151,9 +151,9 @@ impl UhidDevice {
                     io::Error::new(
                         e.kind(),
                         format!(
-                            "{}: permission denied. Install packaging/99-pocketkey.rules into \
-                             /etc/udev/rules.d/ and re-plug (sudo udevadm trigger /dev/uhid) \
-                             so your session gets access to /dev/uhid",
+                            "{}: permission denied. Run `sudo make install` (installs the udev rule \
+                             and loads the uhid module), then `sudo modprobe uhid && sudo udevadm \
+                             trigger --action=add /sys/class/misc/uhid`; log out and in if needed",
                             path.display()
                         ),
                     )

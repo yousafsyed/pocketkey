@@ -2,6 +2,7 @@
 set -e
 if [ "$1" = "configure" ]; then
     udevadm control --reload || true
-    udevadm trigger --name-match=uhid || true
+    modprobe uhid || true
+    udevadm trigger --action=add /sys/class/misc/uhid || true
 fi
 #DEBHELPER#

@@ -102,7 +102,8 @@ Cancel from the window, from Firefox's dialog, or on the phone.
   a different way: whoever holds it can make your phone pop up a passkey
   prompt without a QR scan. The phone still requires your biometrics. Delete
   the file to unlink all phones (or unlink from the phone's passkey settings).
-- The udev rule grants the active desktop session access to `/dev/uhid`, i.e.
+- The install loads the `uhid` kernel module at boot and the udev rule grants
+  the active desktop session access to `/dev/uhid`, i.e.
   any program in your session may create virtual input devices. That is
   the trade-off for running without root.
 - Logs never include request payloads, credential IDs or linking secrets at
@@ -130,8 +131,11 @@ getfacl /dev/uhid                        # should list your user after `make ins
 cargo run --example hidclient            # INIT + getInfo + PING through hidraw
 ```
 
-- *"permission denied: /dev/uhid"*: install the udev rule (`sudo make install`)
-  and run `sudo udevadm trigger --name-match=uhid`, or log out and in.
+- *"permission denied: /dev/uhid"*: the `uhid` kernel module must be loaded
+  (`lsmod | grep uhid`; `sudo make install` adds it to `modules-load.d` and
+  loads it) and the udev rule applied:
+  `sudo udevadm trigger --action=add /sys/class/misc/uhid`. The ACL is given
+  to the active desktop session, so log out and in if it still fails.
 - *Firefox shows nothing*: confirm Firefox is not the snap (`snap list firefox`
   must be empty) and that `fido2-token -L` lists the device.
 - *QR never completes*: both devices need internet access (tunnel server) and
