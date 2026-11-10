@@ -83,6 +83,9 @@ fn main() -> anyhow::Result<()> {
         .block_on(async { UhidDevice::create() })
         .context("creating the virtual FIDO device")?;
     info!(name = uhid::DEVICE_NAME, "virtual FIDO2 key ready");
+    if let Some(advice) = pocketkey::snapcheck::advice() {
+        warn!("{advice}");
+    }
 
     let (status_tx, status_rx) = watch::channel(Status::Idle);
     let (request_tx, request_rx) = watch::channel(None);

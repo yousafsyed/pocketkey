@@ -140,41 +140,42 @@ pub struct UhidDevice {
 }
 
 impl UhidDevice {
-    /// Open `/dev/uhid` and create the virtual FIDO device.
+    /// Obtain the virtual FIDO device. Prefers the privileged helper socket
+    /// (see `pocketkey-uhid-helper`), which hands over a descriptor for a
+    /// device whose descriptor is fixed to the FIDO usage page, so the user
+    /// session never needs access to `/dev/uhid` itself. Falls back to opening
+    /// `/dev/uhid` directly for installs without the helper.
     pub fn create() -> io::Result<Self> {
+        match helper::request_device(Path::new(helper::SOCKET_PATH)) {
+            Ok(file) => {
+                debug!(socket = helper::SOCKET_PATH, "device received from helper");
+                return Self::from_created(file);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                debug!("uhid helper socket not present; opening /dev/uhid directly");
+            }
+            Err(e) => return Err(e),
+        }
         Self::create_at(Path::new("/dev/uhid"))
     }
 
     pub fn create_at(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|e| {
-                if e.kind() == io::ErrorKind::PermissionDenied {
-                    io::Error::new(
-                        e.kind(),
-                        format!(
-                            "{}: permission denied. Run `sudo make install` (installs the udev rule \
-                             and loads the uhid module), then `sudo modprobe uhid && sudo udevadm \
-                             trigger --action=add /sys/class/misc/uhid`; log out and in if needed",
-                            path.display()
-                        ),
-                    )
-                } else {
-                    e
-                }
-            })?;
-
-        // SAFETY: `file` owns the descriptor for the lifetime of the AsyncFd
-        // and nothing else closes or duplicates it (the I/O-safety contract
-        // `register` asks the caller to uphold).
-        let fd = unsafe { AsyncFd::register(file)? };
-        let mut dev = Self {
-            fd,
-            destroyed: false,
-        };
+        let file = open_uhid(path).map_err(|e| {
+            if e.kind() == io::ErrorKind::PermissionDenied {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{}: permission denied. Install and start the pocketkey-uhid helper \
+                         (`sudo make install` installs its socket unit), or grant this user \
+                         access to /dev/uhid",
+                        path.display()
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
+        let mut dev = Self::wrap(file)?;
         dev.write_event(&create2_event())?;
         debug!(
             name = DEVICE_NAME,
@@ -183,6 +184,24 @@ impl UhidDevice {
             "uhid device created"
         );
         Ok(dev)
+    }
+
+    /// Wrap a `/dev/uhid` descriptor on which `UHID_CREATE2` has already been
+    /// issued (by the privileged helper).
+    pub fn from_created(file: File) -> io::Result<Self> {
+        set_nonblocking_cloexec(&file)?;
+        Self::wrap(file)
+    }
+
+    fn wrap(file: File) -> io::Result<Self> {
+        // SAFETY: `file` owns the descriptor for the lifetime of the AsyncFd
+        // and nothing else closes or duplicates it (the I/O-safety contract
+        // `register` asks the caller to uphold).
+        let fd = unsafe { AsyncFd::register(file)? };
+        Ok(Self {
+            fd,
+            destroyed: false,
+        })
     }
 
     /// Wait for the next event that matters to the caller. `UHID_START` and
@@ -351,6 +370,280 @@ fn report_from_output(data: &[u8]) -> Option<Report> {
     let mut report = [0u8; REPORT_SIZE];
     report.copy_from_slice(bytes);
     Some(report)
+}
+
+fn open_uhid(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
+fn set_nonblocking_cloexec(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: fcntl on a descriptor we own; flags are plain integers.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd_flags = libc::fcntl(fd, libc::F_GETFD);
+        if fd_flags < 0 || libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// The privileged helper protocol: the daemon connects to the helper's Unix
+/// socket and receives one `/dev/uhid` descriptor with the FIDO device already
+/// created, via `SCM_RIGHTS`. Both sides of the protocol live here so the
+/// helper binary and the daemon cannot drift apart.
+pub mod helper {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    /// Where the system helper listens (socket-activated by systemd).
+    pub const SOCKET_PATH: &str = "/run/pocketkey/uhid.sock";
+    /// Single-byte request/response codes. Deliberately tiny: no parsing of
+    /// untrusted structured data happens in the privileged process.
+    pub const REQUEST_DEVICE: u8 = 0x01;
+    pub const REPLY_DEVICE: u8 = 0x01;
+    pub const REPLY_BUSY: u8 = 0x02;
+    pub const REPLY_ERROR: u8 = 0x03;
+    const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Client side: ask the helper for a created device descriptor.
+    pub fn request_device(socket: &Path) -> io::Result<File> {
+        let stream = UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(IO_TIMEOUT))?;
+        send_byte(&stream, REQUEST_DEVICE, None)?;
+        let (code, fd) = recv_byte(&stream)?;
+        match (code, fd) {
+            (REPLY_DEVICE, Some(fd)) => Ok(File::from(fd)),
+            (REPLY_BUSY, _) => Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "the uhid helper reports a virtual FIDO device already exists for this user",
+            )),
+            (REPLY_ERROR, _) => Err(io::Error::other(
+                "the uhid helper could not create the virtual FIDO device (see its journal)",
+            )),
+            (code, _) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected reply {code:#04x} from the uhid helper"),
+            )),
+        }
+    }
+
+    /// Helper side: create the device on `/dev/uhid`. The returned descriptor
+    /// is passed to the client and then closed here; the device lives as long
+    /// as the client keeps it open.
+    pub fn create_device_for_client(uhid_path: &Path) -> io::Result<File> {
+        let mut file = open_uhid(uhid_path)?;
+        let ev = create2_event();
+        let n = file.write(&ev)?;
+        if n != ev.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!("short uhid write: {n} of {} bytes", ev.len()),
+            ));
+        }
+        Ok(file)
+    }
+
+    /// Send one code byte, optionally with a descriptor attached.
+    pub fn send_byte(stream: &UnixStream, code: u8, fd: Option<&File>) -> io::Result<()> {
+        let data = [code];
+        let mut iov = libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: 1,
+        };
+        let mut control = [0u8; CMSG_SPACE_FD];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if let Some(file) = fd {
+            msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = CMSG_SPACE_FD as _;
+            // SAFETY: the control buffer is large enough for one fd and
+            // msg_control points at it.
+            unsafe {
+                let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+                std::ptr::write_unaligned(
+                    libc::CMSG_DATA(cmsg) as *mut libc::c_int,
+                    file.as_raw_fd(),
+                );
+            }
+        }
+        // SAFETY: msg and all buffers it references are valid for the call.
+        let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if sent != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short write to uhid helper socket",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Receive one code byte and, if attached, exactly one descriptor. Any
+    /// additional descriptors are closed, never leaked into the process.
+    pub fn recv_byte(stream: &UnixStream) -> io::Result<(u8, Option<OwnedFd>)> {
+        let mut data = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: data.as_mut_ptr() as *mut libc::c_void,
+            iov_len: 1,
+        };
+        let mut control = [0u8; CMSG_SPACE_FD * 4];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = control.len() as _;
+        // SAFETY: msg and all buffers it references are valid for the call.
+        let received =
+            unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if received < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if received == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "uhid helper closed the connection",
+            ));
+        }
+        let mut fd: Option<OwnedFd> = None;
+        // SAFETY: iterating the control messages the kernel filled in.
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let header = libc::CMSG_LEN(0) as usize;
+                    let count =
+                        ((*cmsg).cmsg_len as usize - header) / std::mem::size_of::<libc::c_int>();
+                    let base = libc::CMSG_DATA(cmsg) as *const libc::c_int;
+                    for i in 0..count {
+                        let raw = std::ptr::read_unaligned(base.add(i));
+                        let owned = OwnedFd::from_raw_fd(raw);
+                        if fd.is_none() {
+                            fd = Some(owned);
+                        }
+                        // Extra descriptors drop (close) here.
+                    }
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+        }
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated control message from uhid helper",
+            ));
+        }
+        Ok((data[0], fd))
+    }
+
+    const CMSG_SPACE_FD: usize = 24;
+
+    /// Credentials of the peer process, used by the helper for authorization
+    /// and per-user limits.
+    pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: getsockopt writes at most `len` bytes into `cred`.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut libc::ucred as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(cred.uid)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Read;
+
+        #[test]
+        fn cmsg_space_matches_libc() {
+            // SAFETY: pure arithmetic macro.
+            let expected = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) };
+            assert_eq!(CMSG_SPACE_FD, expected as usize);
+        }
+
+        #[test]
+        fn passes_a_descriptor_and_code_over_a_socketpair() {
+            let (a, b) = UnixStream::pair().unwrap();
+            let mut payload = tempfile();
+            payload.write_all(b"hello").unwrap();
+            send_byte(&a, REPLY_DEVICE, Some(&payload)).unwrap();
+            let (code, fd) = recv_byte(&b).unwrap();
+            assert_eq!(code, REPLY_DEVICE);
+            let mut received = File::from(fd.expect("descriptor attached"));
+            use std::io::Seek;
+            received.seek(std::io::SeekFrom::Start(0)).unwrap();
+            let mut text = String::new();
+            received.read_to_string(&mut text).unwrap();
+            assert_eq!(text, "hello");
+        }
+
+        #[test]
+        fn plain_codes_carry_no_descriptor() {
+            let (a, b) = UnixStream::pair().unwrap();
+            send_byte(&a, REPLY_BUSY, None).unwrap();
+            let (code, fd) = recv_byte(&b).unwrap();
+            assert_eq!(code, REPLY_BUSY);
+            assert!(fd.is_none());
+        }
+
+        #[test]
+        fn peer_uid_is_our_own_on_a_socketpair() {
+            let (a, _b) = UnixStream::pair().unwrap();
+            // SAFETY: geteuid has no preconditions.
+            assert_eq!(peer_uid(&a).unwrap(), unsafe { libc::geteuid() });
+        }
+
+        #[test]
+        fn request_device_reports_a_missing_socket_as_not_found() {
+            let err = request_device(Path::new("/nonexistent/pocketkey/uhid.sock")).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        }
+
+        fn tempfile() -> File {
+            let path = std::env::temp_dir().join(format!(
+                "pocketkey-uhid-helper-test-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let _ = std::fs::remove_file(&path);
+            file
+        }
+    }
 }
 
 fn create2_event() -> [u8; UHID_EVENT_SIZE] {

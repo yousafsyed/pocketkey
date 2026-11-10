@@ -1,7 +1,7 @@
 # pocketkey build/install helpers.
 #
 #   make build            release build (needs libdbus-1-dev; or FEATURES=vendored-dbus)
-#   sudo make install     binary + udev rule (system-wide); run `make build` first
+#   sudo make install     binaries + privileged uhid helper units (system-wide); run `make build` first
 #   make install-user     systemd user unit for the current user, enabled + started
 #   make uninstall-user / sudo make uninstall
 
@@ -9,6 +9,7 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 UDEV_RULES_DIR ?= /etc/udev/rules.d
 MODULES_LOAD_DIR ?= /etc/modules-load.d
+SYSTEM_UNIT_DIR ?= /etc/systemd/system
 USER_UNIT_DIR ?= $(HOME)/.config/systemd/user
 FEATURES ?=
 CARGO ?= cargo
@@ -31,17 +32,19 @@ fmt:
 # Installs the already-built binary; run `make build` first (as your user,
 # not root, so cargo from rustup is on PATH).
 install:
-	@test -x target/release/pocketkey || { echo "target/release/pocketkey not found; run 'make build' first"; exit 1; }
+	@test -x target/release/pocketkey -a -x target/release/pocketkey-uhid-helper || { echo "release binaries not found; run 'make build' first"; exit 1; }
 	install -Dm755 target/release/pocketkey $(DESTDIR)$(BINDIR)/pocketkey
-	install -Dm644 packaging/60-pocketkey.rules $(DESTDIR)$(UDEV_RULES_DIR)/60-pocketkey.rules
-	rm -f $(DESTDIR)$(UDEV_RULES_DIR)/99-pocketkey.rules
+	install -Dm755 target/release/pocketkey-uhid-helper $(DESTDIR)$(BINDIR)/pocketkey-uhid-helper
+	# Older installs granted the whole desktop session /dev/uhid; remove that.
+	rm -f $(DESTDIR)$(UDEV_RULES_DIR)/60-pocketkey.rules $(DESTDIR)$(UDEV_RULES_DIR)/99-pocketkey.rules
 	install -Dm644 packaging/pocketkey-modules.conf $(DESTDIR)$(MODULES_LOAD_DIR)/pocketkey.conf
+	sed 's|^ExecStart=.*|ExecStart=$(BINDIR)/pocketkey-uhid-helper|' packaging/pocketkey-uhid.service > $(DESTDIR)$(SYSTEM_UNIT_DIR)/pocketkey-uhid.service
+	install -Dm644 packaging/pocketkey-uhid.socket $(DESTDIR)$(SYSTEM_UNIT_DIR)/pocketkey-uhid.socket
 	@if [ -z "$(DESTDIR)" ]; then \
 		udevadm control --reload; \
 		modprobe uhid; \
-		udevadm trigger --action=add /sys/class/misc/uhid; \
-		udevadm settle; \
-		echo "/dev/uhid ACL: $$(getfacl -p /dev/uhid 2>/dev/null | grep '^user:' | tr '\n' ' ')"; \
+		systemctl daemon-reload; \
+		systemctl enable --now pocketkey-uhid.socket; \
 	fi
 
 install-user:
@@ -52,7 +55,11 @@ install-user:
 	systemctl --user --no-pager status pocketkey.service || true
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/pocketkey $(DESTDIR)$(UDEV_RULES_DIR)/60-pocketkey.rules $(DESTDIR)$(MODULES_LOAD_DIR)/pocketkey.conf
+	-systemctl disable --now pocketkey-uhid.socket pocketkey-uhid.service
+	rm -f $(DESTDIR)$(BINDIR)/pocketkey $(DESTDIR)$(BINDIR)/pocketkey-uhid-helper
+	rm -f $(DESTDIR)$(SYSTEM_UNIT_DIR)/pocketkey-uhid.socket $(DESTDIR)$(SYSTEM_UNIT_DIR)/pocketkey-uhid.service
+	rm -f $(DESTDIR)$(UDEV_RULES_DIR)/60-pocketkey.rules $(DESTDIR)$(MODULES_LOAD_DIR)/pocketkey.conf
+	-systemctl daemon-reload
 	-udevadm control --reload
 
 uninstall-user:

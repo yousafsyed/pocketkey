@@ -22,12 +22,17 @@ transport Firefox already supports (CTAPHID over USB HID).
 
 ```
 Firefox ──hidraw──▶ /dev/uhid ──▶ pocketkey ──BLE + wss tunnel──▶ phone
-            CTAPHID              CTAP2 CBOR        hybrid/caBLE      (authenticator)
+            CTAPHID        ▲     CTAP2 CBOR        hybrid/caBLE      (authenticator)
+                           │ fd (SCM_RIGHTS)
+              pocketkey-uhid-helper (root, socket-activated, creates the device)
 ```
 
-1. pocketkey registers a HID device with the FIDO usage page. Firefox finds it
-   like any security key and performs `CTAPHID_INIT` and `authenticatorGetInfo`.
-   Both are answered locally.
+1. A tiny root helper (`pocketkey-uhid-helper`, socket-activated by systemd)
+   creates the virtual HID device with the FIDO usage page and passes the
+   `/dev/uhid` descriptor to the user daemon. The user session never gets
+   access to `/dev/uhid` itself, so nothing in it can create other virtual
+   input devices. Firefox finds the key like any security key and performs
+   `CTAPHID_INIT` and `authenticatorGetInfo`. Both are answered locally.
 2. When `getAssertion` or `makeCredential` arrives, a small window opens. If a
    phone was linked before, it gets a push notification ("check your phone");
    otherwise a QR code is shown. The phone scans it, advertises over BLE to
@@ -70,7 +75,7 @@ From source:
 sudo apt install build-essential pkg-config libdbus-1-dev     # build deps
 sudo apt install fido2-tools                                   # optional, for testing
 cargo build --release    # as your user
-sudo make install        # /usr/local/bin/pocketkey + udev rule for /dev/uhid
+sudo make install        # binaries + root uhid helper (socket-activated)
 make install-user        # systemd user service, enabled and started
 ```
 
@@ -94,10 +99,14 @@ compiles libdbus from source instead.
 Check it is alive:
 
 ```sh
+systemctl status pocketkey-uhid.socket   # root helper socket, listening
 systemctl --user status pocketkey
 fido2-token -L                     # should list "pocketkey virtual FIDO key"
 fido2-token -I /dev/hidrawN        # getInfo: FIDO_2_0/2_1, rk/up/uv, no clientPin
 ```
+
+If you use the snap-packaged Firefox, pocketkey logs a warning at startup:
+the snap cannot see the virtual key (see Requirements).
 
 ## Use
 
@@ -135,10 +144,14 @@ pocketkey window; selection no longer happens automatically.
   Corrupt or unsafe stores fail startup rather than being overwritten; limits
   are 128 phones and 1 MiB. The store directory must be owned by your user and
   private (0700), with the file private (0600).
-- The install loads the `uhid` kernel module at boot and the udev rule grants
-  the active desktop session access to `/dev/uhid`, i.e.
-  any program in your session may create virtual input devices. That is
-  the trade-off for running without root.
+- Only the root helper (`pocketkey-uhid-helper`) opens `/dev/uhid`. It is
+  socket-activated, hardened with systemd sandboxing, creates exactly one
+  device per user with a fixed FIDO report descriptor, and passes the
+  descriptor to the user daemon. A `uhid` descriptor can only emit reports
+  for the device it already created, so the user session cannot turn it
+  into a keyboard or any other input device. Earlier versions granted the
+  whole desktop session access to `/dev/uhid` via a udev rule; upgrading
+  removes that rule.
 - Pocketkey's own request/response diagnostics use allowlisted metadata rather
   than raw CBOR values. Detailed logging is scoped to Pocketkey; dependency
   logs stay at `info` or below even with `RUST_LOG=trace`. Treat logs as private
@@ -147,6 +160,9 @@ pocketkey window; selection no longer happens automatically.
   HID channel IDs multiplex clients; they are not an authorization boundary.
   Resource limits prevent unbounded channel allocation, but a malicious local
   client can still compete with legitimate requests.
+- Any local user can ask the helper for a virtual FIDO key (one per user).
+  That only lets them present a FIDO device to their own session, which
+  they could do with real hardware anyway.
 
 ## Limitations
 
@@ -176,17 +192,18 @@ pocketkey window; selection no longer happens automatically.
 
 ```sh
 journalctl --user -u pocketkey -f        # daemon log; RUST_LOG=debug for more
+journalctl -u pocketkey-uhid -f          # root helper log
 fido2-token -L                           # is the virtual key visible?
 bluetoothctl show                        # is an adapter present and Powered: yes?
-getfacl /dev/uhid                        # should list your user after `make install`
+systemctl status pocketkey-uhid.socket   # helper socket must be listening
 cargo run --example hidclient            # INIT + getInfo + PING through hidraw
 ```
 
-- *"permission denied: /dev/uhid"*: the `uhid` kernel module must be loaded
-  (`lsmod | grep uhid`; `sudo make install` adds it to `modules-load.d` and
-  loads it) and the udev rule applied:
-  `sudo udevadm trigger --action=add /sys/class/misc/uhid`. The ACL is given
-  to the active desktop session, so log out and in if it still fails.
+- *"creating the virtual FIDO device" fails*: check that
+  `pocketkey-uhid.socket` is enabled and the `uhid` kernel module is loaded
+  (`lsmod | grep uhid`; `sudo modprobe uhid`). The helper logs to
+  `journalctl -u pocketkey-uhid`. If the helper reports the device "already
+  exists for this user", another pocketkey instance is running for you.
 - *Firefox shows nothing*: confirm Firefox is not the snap (`snap list firefox`
   must be empty) and that `fido2-token -L` lists the device.
 - *QR never completes*: both devices need internet access (tunnel server) and
@@ -209,7 +226,8 @@ Dependencies come from upstream Git/crates.io sources and are resolved in
 regressions. Dependency updates should be reviewed and tested with both phone
 platforms before release.
 
-Layout: `src/uhid.rs` (kernel interface), `src/ctaphid.rs` (pure transport
+Layout: `src/uhid.rs` (kernel interface and helper fd-passing protocol),
+`src/bin/pocketkey-uhid-helper.rs` (root helper), `src/ctaphid.rs` (pure transport
 state machine), `src/ctap2/` (command dispatch and getInfo),
 `src/hybrid/` (phone transport over `pxp`, linked-device store), `src/ui.rs`
 (egui window), `src/main.rs` (wiring). See `PLAN.md` for design decisions and
@@ -217,18 +235,8 @@ state machine), `src/ctap2/` (command dispatch and getInfo),
 
 ## License
 
-Copyright (c) 2026 S. Yousaf Ali. All rights reserved.
-
-pocketkey is **source-available** under the
-[PolyForm Noncommercial License 1.0.0](LICENSE.md):
-
-- **Free for personal and noncommercial use.** Individuals, hobbyists,
-  non-profits, educational and research use may use, modify and share it at
-  no cost, as long as the copyright notice is kept.
-- **Commercial use requires a paid license.** Using pocketkey in or for a
-  business, or in a product or service you sell, needs a commercial license
-  from the author: open an issue or discussion on
-  [GitHub](https://github.com/yousafsyed/pocketkey).
+pocketkey is open source under the [MIT License](LICENSE.md).
+Copyright (c) 2026 S. Yousaf Ali.
 
 pocketkey builds on the LGPL-2.1 `pxp` crate from
 [libwebauthn](https://github.com/linux-credentials/libwebauthn); its terms

@@ -1,0 +1,44 @@
+[Unit]
+Description=pocketkey virtual FIDO device helper
+Documentation=https://github.com/yousafsyed/pocketkey
+Requires=pocketkey-uhid.socket
+After=pocketkey-uhid.socket
+
+[Service]
+Type=simple
+# The uhid module is loaded at boot via modules-load.d (pocketkey.conf);
+# ProtectKernelModules below forbids loading it from here.
+ExecStart=/usr/bin/pocketkey-uhid-helper
+Environment=RUST_LOG=info
+# The helper only opens /dev/uhid, issues one UHID_CREATE2 and passes the
+# descriptor over the socket. Lock everything else down. It runs as uid 0
+# because /dev/uhid is root-only (0600); no capabilities are needed for that,
+# so the bounding set is emptied.
+DeviceAllow=/dev/uhid rw
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+# @resources stays allowed: the Rust runtime reads RLIMIT_STACK (prlimit64)
+# at startup, which would otherwise be killed by seccomp.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallArchitectures=native
+UMask=0077

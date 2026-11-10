@@ -5,5 +5,6 @@
 pub mod ctap2;
 pub mod ctaphid;
 pub mod hybrid;
+pub mod snapcheck;
 pub mod uhid;
 pub mod ui;

@@ -15,10 +15,13 @@ the phone first). Watch logs in a second terminal:
 
 | # | Step | Expect |
 |---|------|--------|
-| 1.1 | `ls -l /dev/hidraw*` before and after `systemctl --user restart pocketkey` | one new hidraw node |
+| 1.0 | `systemctl status pocketkey-uhid.socket`; `getfacl /dev/uhid` | socket listening; `/dev/uhid` has **no** user ACL entry (root-only) |
+| 1.1 | `ls -l /dev/hidraw*` before and after `systemctl --user restart pocketkey` | one new hidraw node; `journalctl -u pocketkey-uhid` shows "handed to user daemon" |
 | 1.2 | `fido2-token -L` | lists `pocketkey virtual FIDO key` (vendor 0x1209, product 0x0001) |
 | 1.3 | `cargo run --example hidclient` | `INIT ok ... caps=0x0d`, getInfo map printed, `PING ok` |
-| 1.4 | `systemctl --user stop pocketkey` | hidraw node disappears (clean `UHID_DESTROY`) |
+| 1.4 | `systemctl --user stop pocketkey` | hidraw node disappears (clean `UHID_DESTROY`); helper logs "device slot released" |
+| 1.5 | Start a second `pocketkey` as the same user while the service runs | it exits with "already exists for this user" |
+| 1.6 | Second desktop user logs in | gets their own virtual key with no extra setup |
 
 ## M2: getInfo
 
