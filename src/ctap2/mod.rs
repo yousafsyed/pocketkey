@@ -4,15 +4,19 @@
 //! response is `status_byte ++ cbor_map`. We answer `authenticatorGetInfo`,
 //! `authenticatorSelection`, `authenticatorReset` and Firefox's silent
 //! pre-flight probes (see [`preflight`]) locally, and forward `makeCredential`
-//! and `getAssertion` to the phone byte-for-byte via the [`crate::hybrid`]
-//! module.
+//! and `getAssertion` to the phone via [`crate::hybrid`] after strict decoding,
+//! canonical encoding and the narrowly scoped phone compatibility fill-ins.
 
 pub mod canonical;
 pub mod compat;
 pub mod describe;
 pub mod preflight;
 
-use std::collections::VecDeque;
+#[cfg(test)]
+mod security_tests;
+
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use ciborium::Value;
 
@@ -37,6 +41,7 @@ pub mod status {
     pub const CTAP1_ERR_INVALID_LENGTH: u8 = 0x03;
     pub const CTAP2_ERR_INVALID_CBOR: u8 = 0x12;
     pub const CTAP2_ERR_MISSING_PARAMETER: u8 = 0x14;
+    pub const CTAP2_ERR_LIMIT_EXCEEDED: u8 = 0x15;
     pub const CTAP2_ERR_OPERATION_DENIED: u8 = 0x27;
     pub const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
     pub const CTAP2_ERR_USER_ACTION_TIMEOUT: u8 = 0x2F;
@@ -54,6 +59,19 @@ pub const AAGUID: [u8; 16] = [
 /// Largest CTAP message we accept, advertised in getInfo.
 pub const MAX_MSG_SIZE: u64 = 2048;
 
+/// Separate from the byte limit: even a one-byte CBOR item occupies a byte,
+/// so no request fitting MAX_MSG_SIZE can be count-chunked at this bound.
+/// Omission is unsafe: Mozilla falls back to a count of 1 (see preflight).
+pub const MAX_CREDENTIAL_COUNT_IN_LIST: u64 = MAX_MSG_SIZE;
+/// Advertised ID-length bound: the two-byte length in attested credential data
+/// permits IDs up to 65535 bytes. Chromium needs a positive value here or it
+/// ignores our list-count bound and probes one ID at a time. Using MAX_MSG_SIZE
+/// instead would silently filter oversized exclusions before we could reject
+/// their request. The independent 2048-byte frame limit still applies.
+pub const MAX_CREDENTIAL_ID_LENGTH: u64 = u16::MAX as u64;
+pub const ASSERTION_SEQUENCE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TRACKED_CHANNELS: usize = crate::ctaphid::MAX_CHANNELS;
+
 /// What to do with a CTAPHID_CBOR payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Disposition {
@@ -61,13 +79,35 @@ pub enum Disposition {
     Respond(Vec<u8>),
     /// Forward this payload (`cmd ++ cbor`, canonically re-encoded) to the phone.
     Forward { hint: Hint, frame: Vec<u8> },
+    /// Main must await explicit user confirmation (or cancellation/timeout).
+    /// Never answer success merely because this virtual device is available.
+    Select,
 }
 
-/// Per-device CTAP2 state: the only state is the queue of synthetic
-/// assertions left to serve through `getNextAssertion` after a pre-flight.
-#[derive(Debug, Default)]
-pub struct Ctap2 {
+/// A sequence is channel-owned and expires without refreshing on reads.
+#[derive(Default)]
+struct ChannelState {
     pending_assertions: VecDeque<Vec<u8>>,
+    expires: Option<Instant>,
+    probe_seen: bool,
+    probe_request: Option<Value>,
+    // A rejected probe must not turn into an unchecked empty excludeList when
+    // the client ignores the error. Explicit CANCEL clears this soft latch.
+    blocked: bool,
+    // HID rejected/abandoned CBOR before dispatch, or a CTAP frame exceeded
+    // the byte limit. Oversized continuation tails can resemble CANCEL, so
+    // only a genuine new channel lifecycle clears this.
+    rejected_cbor: bool,
+}
+
+/// Bounded per-channel state; never evict a failure latch to accept a request.
+#[derive(Default)]
+pub struct Ctap2 {
+    channels: HashMap<u32, ChannelState>,
+    // Should be unreachable with synchronized HID lifecycle events. If a hard
+    // rejection cannot be recorded, fail all credential operations closed for
+    // this Ctap2 instance: freeing a different channel cannot erase that failure.
+    rejection_overflow: bool,
 }
 
 impl Ctap2 {
@@ -75,97 +115,272 @@ impl Ctap2 {
         Self::default()
     }
 
-    /// Decide how a CTAPHID_CBOR payload is handled.
+    /// Convenience for single-channel callers. The HID loop must use the
+    /// explicit channel API and map Reset, Reinitialized and RejectedCbor to
+    /// their respective lifecycle methods below (including events from ticks).
     pub fn dispatch(&mut self, payload: &[u8]) -> Disposition {
+        self.dispatch_on_channel(0, payload, Instant::now())
+    }
+
+    /// Discard normal preflight state on CANCEL, preserving transport rejection.
+    /// Oversized continuation sequence 145 can look like zero-length CANCEL;
+    /// accepting it as cancellation must not permit an unchecked registration.
+    pub fn reset_channel(&mut self, cid: u32) {
+        if self
+            .channels
+            .get(&cid)
+            .is_some_and(|state| state.rejected_cbor)
+        {
+            self.channels.insert(
+                cid,
+                ChannelState {
+                    rejected_cbor: true,
+                    ..ChannelState::default()
+                },
+            );
+        } else {
+            self.channels.remove(&cid);
+        }
+    }
+
+    /// Clear all per-channel state only for HID's validated INIT/new lifecycle
+    /// or channel reclamation event, never for malformed INIT or CHANNEL_BUSY.
+    pub fn reinitialize_channel(&mut self, cid: u32) {
+        self.channels.remove(&cid);
+    }
+
+    /// Latch a CBOR request rejected/abandoned by HID before CTAP could inspect
+    /// it. Main must call this only for RejectedCbor, NOT ordinary CHANNEL_BUSY.
+    /// Repeated rejections are idempotent and never refresh or drop the latch.
+    pub fn reject_channel(&mut self, cid: u32) {
+        // Empty states hold no security decision and may be discarded. Never
+        // evict a live sequence, soft failure or hard rejection to make room.
+        self.channels.retain(|_, state| {
+            state.rejected_cbor
+                || state.blocked
+                || state.probe_seen
+                || !state.pending_assertions.is_empty()
+        });
+        if !self.channels.contains_key(&cid) && self.channels.len() >= MAX_TRACKED_CHANNELS {
+            self.rejection_overflow = true;
+            return;
+        }
+        self.channels.insert(
+            cid,
+            ChannelState {
+                rejected_cbor: true,
+                ..ChannelState::default()
+            },
+        );
+    }
+
+    pub fn dispatch_on_channel(&mut self, cid: u32, payload: &[u8], now: Instant) -> Disposition {
+        // Retain failed or unfinished preflights: silently evicting those could
+        // let a delayed makeCredential bypass a failed exclusion probe.
+        self.channels.retain(|_, state| {
+            if state.expires.is_some_and(|deadline| now >= deadline) {
+                state.pending_assertions.clear();
+                state.probe_request = None;
+                state.expires = None;
+                state.blocked |= state.probe_seen;
+            }
+            state.rejected_cbor
+                || state.blocked
+                || state.probe_seen
+                || !state.pending_assertions.is_empty()
+        });
+        if self.rejection_overflow
+            && matches!(
+                payload.first(),
+                Some(&command::MAKE_CREDENTIAL)
+                    | Some(&command::GET_ASSERTION)
+                    | Some(&command::GET_NEXT_ASSERTION)
+            )
+        {
+            return Disposition::Respond(vec![status::CTAP2_ERR_OPERATION_DENIED]);
+        }
+        if !self.channels.contains_key(&cid) && self.channels.len() >= MAX_TRACKED_CHANNELS {
+            return Disposition::Respond(vec![status::CTAP2_ERR_LIMIT_EXCEEDED]);
+        }
+        let state = self.channels.entry(cid).or_default();
         let Some((&cmd, cbor)) = payload.split_first() else {
+            state.pending_assertions.clear();
+            state.blocked |= state.probe_seen;
             return Disposition::Respond(vec![status::CTAP1_ERR_INVALID_LENGTH]);
         };
+        if cmd != command::GET_NEXT_ASSERTION {
+            state.pending_assertions.clear();
+        }
         if payload.len() > MAX_MSG_SIZE as usize {
+            *state = ChannelState {
+                rejected_cbor: true,
+                ..ChannelState::default()
+            };
             return Disposition::Respond(vec![status::CTAP2_ERR_REQUEST_TOO_LARGE]);
         }
-        // Any command other than getNextAssertion ends a pre-flight sequence.
-        if cmd != command::GET_NEXT_ASSERTION {
-            self.pending_assertions.clear();
+        if matches!(
+            cmd,
+            command::GET_INFO | command::GET_NEXT_ASSERTION | command::SELECTION | command::RESET
+        ) && !cbor.is_empty()
+        {
+            state.pending_assertions.clear();
+            state.blocked |= state.probe_seen;
+            return Disposition::Respond(vec![status::CTAP1_ERR_INVALID_LENGTH]);
         }
         match cmd {
             command::GET_INFO => Disposition::Respond(get_info_response()),
+            command::MAKE_CREDENTIAL | command::GET_ASSERTION
+                if state.blocked || state.rejected_cbor =>
+            {
+                Disposition::Respond(vec![status::CTAP2_ERR_OPERATION_DENIED])
+            }
             command::MAKE_CREDENTIAL => {
-                describe::log_make_credential_request(cbor);
-                Disposition::Forward {
-                    hint: Hint::MakeCredential,
-                    frame: forwardable(cmd, cbor),
+                if state
+                    .probe_request
+                    .as_ref()
+                    .is_some_and(|probe| !preserves_exclusions(probe, cbor))
+                {
+                    state.blocked = true;
+                    return Disposition::Respond(vec![status::CTAP2_ERR_OPERATION_DENIED]);
                 }
+                describe::log_make_credential_request(cbor);
+                let result = forwardable(cmd, cbor);
+                state.blocked |= state.probe_seen && result.is_err();
+                state.rejected_cbor |= result == Err(status::CTAP2_ERR_REQUEST_TOO_LARGE);
+                state.probe_seen = false;
+                state.probe_request = None;
+                state.expires = None;
+                forward_disposition(result, Hint::MakeCredential)
             }
             command::GET_ASSERTION => match preflight::inspect(cbor) {
                 preflight::Probe::NotSilent => {
                     describe::trace_get_assertion_request(cbor);
-                    Disposition::Forward {
-                        hint: Hint::GetAssertion,
-                        frame: forwardable(cmd, cbor),
-                    }
+                    let result = forwardable(cmd, cbor);
+                    state.blocked |= state.probe_seen && result.is_err();
+                    state.rejected_cbor |= result == Err(status::CTAP2_ERR_REQUEST_TOO_LARGE);
+                    state.probe_seen = false;
+                    state.probe_request = None;
+                    state.expires = None;
+                    forward_disposition(result, Hint::GetAssertion)
                 }
-                preflight::Probe::Error(code) => Disposition::Respond(vec![code]),
+                preflight::Probe::Error(code) => {
+                    state.blocked = true;
+                    state.rejected_cbor |= code == status::CTAP2_ERR_REQUEST_TOO_LARGE;
+                    Disposition::Respond(vec![code])
+                }
                 preflight::Probe::Assertions(mut responses) => {
+                    // A second probe before the real operation is observable
+                    // chunking (or an ambiguous abandoned operation). Fail closed.
+                    if state.probe_seen {
+                        state.blocked = true;
+                        return Disposition::Respond(vec![status::CTAP2_ERR_OPERATION_DENIED]);
+                    }
+                    state.probe_seen = true;
+                    state.probe_request = canonical::decode_map(cbor);
+                    state.expires = Some(now + ASSERTION_SEQUENCE_TIMEOUT);
                     let first = responses.remove(0);
+                    if first.first() != Some(&status::OK) {
+                        state.blocked = true;
+                    }
                     tracing::info!(
                         credentials = responses.len() + 1,
                         "answering silent pre-flight getAssertion locally"
                     );
-                    self.pending_assertions = responses.into();
+                    state.pending_assertions = responses.into();
                     Disposition::Respond(first)
                 }
             },
-            // Phones return a single assertion, so the only getNextAssertion we
-            // ever serve is the continuation of a local pre-flight answer.
-            command::GET_NEXT_ASSERTION => match self.pending_assertions.pop_front() {
-                Some(response) => Disposition::Respond(response),
-                None => Disposition::Respond(vec![status::CTAP2_ERR_NOT_ALLOWED]),
+            command::GET_NEXT_ASSERTION => match state.pending_assertions.pop_front() {
+                Some(response) if !state.blocked && !state.rejected_cbor => {
+                    Disposition::Respond(response)
+                }
+                _ => Disposition::Respond(vec![status::CTAP2_ERR_NOT_ALLOWED]),
             },
-            // We are the only "key" the client can pick, so selection succeeds at once.
-            command::SELECTION => Disposition::Respond(vec![status::OK]),
+            command::SELECTION => Disposition::Select,
             command::RESET => Disposition::Respond(vec![status::CTAP2_ERR_NOT_ALLOWED]),
-            // No PIN support is advertised; a client that asks anyway gets the
-            // same answer a PIN-less key would give for an unsupported command.
             command::CLIENT_PIN => Disposition::Respond(vec![status::CTAP1_ERR_INVALID_COMMAND]),
             _ => Disposition::Respond(vec![status::CTAP1_ERR_INVALID_COMMAND]),
         }
     }
 }
 
-/// `cmd ++ cbor` with the CBOR in canonical key order (see [`canonical`]),
-/// after the makeCredential fill-ins of [`compat`]. Falls back to the
-/// original bytes if they do not decode; the phone will then produce the
-/// error itself.
-fn forwardable(cmd: u8, cbor: &[u8]) -> Vec<u8> {
-    let body = match ciborium::from_reader::<Value, _>(cbor) {
-        Ok(mut value) => {
-            if cmd == command::MAKE_CREDENTIAL {
-                let edits = compat::complete_make_credential(&mut value);
-                if !edits.is_empty() {
-                    tracing::debug!(?edits, "completed makeCredential request for the phone");
-                }
-            }
-            let canonical = canonical::encode_canonical(value);
-            if canonical != cbor {
-                tracing::debug!("re-encoded request CBOR for the phone");
-            }
-            canonical
-        }
-        Err(_) => cbor.to_vec(),
+/// Check everything we actually saw survives Firefox's exclusion filtering.
+fn preserves_exclusions(probe: &Value, cbor: &[u8]) -> bool {
+    fn field(map: &Value, key: i64) -> Option<&Value> {
+        map.as_map()?
+            .iter()
+            .find(|(k, _)| *k == Value::Integer(key.into()))
+            .map(|(_, v)| v)
+    }
+    fn text_field<'a>(map: &'a Value, key: &str) -> Option<&'a Value> {
+        map.as_map()?
+            .iter()
+            .find(|(k, _)| k.as_text() == Some(key))
+            .map(|(_, v)| v)
+    }
+    let Some(request) = canonical::decode_map(cbor) else {
+        return false;
     };
+    let Some(rp) = field(&request, 2) else {
+        return false;
+    };
+    if field(probe, 1) != text_field(rp, "id") {
+        return false;
+    }
+    let Some(allow) = field(probe, 3).and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(exclude) = field(&request, 5).and_then(Value::as_array) else {
+        return false;
+    };
+    allow.iter().all(|credential| {
+        exclude.iter().any(|excluded| {
+            text_field(credential, "id") == text_field(excluded, "id")
+                && text_field(credential, "type") == text_field(excluded, "type")
+        })
+    })
+}
+
+fn forward_disposition(result: Result<Vec<u8>, u8>, hint: Hint) -> Disposition {
+    match result {
+        Ok(frame) => Disposition::Forward { hint, frame },
+        Err(code) => Disposition::Respond(vec![code]),
+    }
+}
+
+/// Strict single-map decode before any edits, canonical re-encoding, and a
+/// second size check after compatibility defaults may have grown the frame.
+fn forwardable(cmd: u8, cbor: &[u8]) -> Result<Vec<u8>, u8> {
+    let mut value = canonical::decode_map(cbor).ok_or(status::CTAP2_ERR_INVALID_CBOR)?;
+    if cmd == command::MAKE_CREDENTIAL {
+        let edits = compat::complete_make_credential(&mut value);
+        if !edits.is_empty() {
+            tracing::debug!(
+                rp_name_added = edits.rp_name_added,
+                display_name_added = edits.display_name_added,
+                false_extensions_removed = edits.false_extensions_removed,
+                "completed makeCredential request for the phone"
+            );
+        }
+    }
+    let body = canonical::encode_canonical(value);
+    if body.len() + 1 > MAX_MSG_SIZE as usize {
+        return Err(status::CTAP2_ERR_REQUEST_TOO_LARGE);
+    }
     let mut frame = Vec::with_capacity(1 + body.len());
     frame.push(cmd);
     frame.extend_from_slice(&body);
-    frame
+    Ok(frame)
 }
 
 /// `authenticatorGetInfo` response, `0x00 ++ cbor`.
 ///
 /// Deliberately minimal so clients never attempt PIN, credential management
 /// or extension flows: no `clientPin`, no `pinUvAuthProtocols`, no
-/// `extensions`. `maxCredentialCountInList`/`maxCredentialIdLength` are
-/// generous so Firefox sends an allowList in one batch instead of probing
-/// credential by credential.
+/// `extensions`. `maxCredentialCountInList` exceeds every encodable list's
+/// count, paired with a positive `maxCredentialIdLength` covering the entire
+/// attested-ID range so both Chromium and Firefox retain exclusions together.
+/// These browser batching hints do NOT relax the independent frame byte limit.
 pub fn get_info_response() -> Vec<u8> {
     let info = Value::Map(vec![
         (
@@ -190,8 +405,14 @@ pub fn get_info_response() -> Vec<u8> {
             Value::Integer(0x05.into()),
             Value::Integer(MAX_MSG_SIZE.into()),
         ),
-        (Value::Integer(0x07.into()), Value::Integer(64.into())),
-        (Value::Integer(0x08.into()), Value::Integer(1024.into())),
+        (
+            Value::Integer(0x07.into()),
+            Value::Integer(MAX_CREDENTIAL_COUNT_IN_LIST.into()),
+        ),
+        (
+            Value::Integer(0x08.into()),
+            Value::Integer(MAX_CREDENTIAL_ID_LENGTH.into()),
+        ),
         (
             Value::Integer(0x09.into()),
             Value::Array(vec![Value::Text("usb".into())]),
@@ -291,13 +512,10 @@ mod tests {
                 frame: vec![command::GET_ASSERTION, 0xA0]
             }
         );
-        // Undecodable CBOR is forwarded untouched.
+        // Undecodable CBOR must not reach the phone.
         assert_eq!(
             dispatch(&[command::MAKE_CREDENTIAL, 0xFF]),
-            Disposition::Forward {
-                hint: Hint::MakeCredential,
-                frame: vec![command::MAKE_CREDENTIAL, 0xFF]
-            }
+            Disposition::Respond(vec![status::CTAP2_ERR_INVALID_CBOR])
         );
         assert_eq!(
             dispatch(&[command::GET_NEXT_ASSERTION]),
@@ -322,7 +540,13 @@ mod tests {
             .collect();
         let req = Value::Map(vec![
             (Value::Integer(1.into()), Value::Text("example.com".into())),
-            (Value::Integer(2.into()), Value::Bytes(vec![0; 32])),
+            (
+                Value::Integer(2.into()),
+                Value::Bytes({
+                    use sha2::{Digest, Sha256};
+                    Sha256::digest(b"").to_vec()
+                }),
+            ),
             (Value::Integer(3.into()), Value::Array(allow)),
             (
                 Value::Integer(5.into()),
@@ -348,6 +572,7 @@ mod tests {
             "queue exhausted"
         );
         // A new pre-flight followed by an unrelated command drops the queue.
+        ctap.reset_channel(0);
         ctap.dispatch(&payload);
         ctap.dispatch(&[command::GET_INFO]);
         assert_eq!(
@@ -358,10 +583,7 @@ mod tests {
 
     #[test]
     fn local_answers_for_selection_reset_pin_unknown_empty() {
-        assert_eq!(
-            dispatch(&[command::SELECTION]),
-            Disposition::Respond(vec![status::OK])
-        );
+        assert_eq!(dispatch(&[command::SELECTION]), Disposition::Select);
         assert_eq!(
             dispatch(&[command::RESET]),
             Disposition::Respond(vec![status::CTAP2_ERR_NOT_ALLOWED])

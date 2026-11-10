@@ -35,8 +35,9 @@ jobs:
       - name: Checks
         run: |
           cargo fmt --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo test --locked --release
 
       - name: Next version
         id: version

@@ -84,6 +84,38 @@ is kept for phones that do send linking data; the tests below apply to those.
 | 7.2 | `sudo apt install ../pocketkey_*.deb && systemctl --user enable --now pocketkey` | 1.2 passes |
 | 7.3 | CI workflow on GitHub | fmt, clippy, test, build green |
 
+## Security-update compatibility gate (both phone platforms)
+
+Automated checks do not replace real-device interoperability testing. Run each
+row with **iPhone / iCloud Keychain** and **Android / Google Password Manager**,
+using Firefox and, where applicable, Chrome's explicit USB-security-key path.
+No hardware pass is claimed by the software test suite.
+
+| Check | Expected |
+|---|---|
+| New-account registration | iPhone accepts completed `rp.name` / `user.displayName`; Android accepts the existing cloud-only caBLE v2 QR. Credential is usable afterward. |
+| Discoverable and allow-list sign-in | Correct account signs in; normal biometrics/phone consent required. |
+| Registration with an existing credential excluded | Registration is denied; exclusion is not removed by local preflight. Include a >64 tiny-ID fixture with the genuine credential last if your test RP supports it. |
+| Large allow/exclude lists | Received requests exceeding 2048 bytes fail rather than dropping exclusions. After a rejected HID message, reinitialize/reopen the key before retrying; CANCEL alone must not clear the hard rejection. |
+| Two authenticators attached | Selection waits for an explicit click; pocketkey does not automatically win over a physical key. |
+| Cancel from browser, window and phone, then immediately retry | No stale QR/status, assertion, selection or cancellation affects the next request. |
+| Deny request on phone | No green success indicator; browser receives the phone's CTAP error. |
+| Linked-phone flow, when supported | Notification succeeds, or bounded fallback shows QR. |
+| Stop daemon, delete linked store, restart | No old phone contacted; linking a new phone never restores deleted records. Deleting during idle operation is also observed before the next lookup. |
+| Diagnostic screenshot of QR screen | File is private and QR pixels are redacted. No usable QR is persisted. |
+
+Local regression commands (no kernel/Bluetooth access required):
+
+```sh
+cargo test --locked
+cargo test --locked --release
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --check
+```
+
+These tests cover Pocketkey's code against the dependencies pinned in
+`Cargo.lock`. Real-device testing is required after dependency updates.
+
 ## Also worth a run
 
 - Chrome (`.deb`) on the same machine: Chrome has native hybrid support, so

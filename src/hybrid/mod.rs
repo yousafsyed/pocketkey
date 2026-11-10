@@ -26,14 +26,20 @@ pub enum Hint {
 pub enum Status {
     #[default]
     Idle,
+    /// A request has begun, before Bluetooth/transport setup completes.
+    Starting,
     /// Contacting a linked phone via the tunnel service (no QR needed).
     LinkedWaitingForPhone {
         name: String,
+        hint: Hint,
     },
     /// Show this `FIDO:/...` payload as a QR code and wait for the scan.
     ShowQr {
         payload: String,
+        hint: Hint,
     },
+    /// Waiting for the desktop user to explicitly select this authenticator.
+    Selecting,
     /// BLE advertisement seen, tunnel being set up.
     PhoneFound,
     /// Encrypted channel established, request sent.
@@ -47,7 +53,7 @@ pub enum Status {
 impl Status {
     /// Whether the user is expected to act on the phone right now.
     pub fn user_action_pending(&self) -> bool {
-        matches!(self, Status::WaitingForUser)
+        matches!(self, Status::WaitingForUser | Status::Selecting)
     }
 }
 

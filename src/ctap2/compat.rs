@@ -10,8 +10,9 @@
 //!
 //! [`complete_make_credential`] applies the smallest edits that make such a
 //! request well-formed for every phone: `rp.name` defaults to `rp.id`,
-//! `user.displayName` defaults to `user.name`, and extension entries whose
-//! input is `false` are removed. These are display labels and no-ops; the
+//! `user.displayName` defaults to `user.name`, and only `hmac-secret: false`
+//! is removed. Other false extension inputs may be meaningful. These edits
+//! are display labels and a known no-op; the
 //! clientDataHash, ids, algorithms and options are never touched.
 
 use ciborium::Value;
@@ -30,8 +31,8 @@ impl Edits {
     }
 }
 
-/// Complete the `rp` (0x02) and `user` (0x03) entities and prune `false`
-/// extension inputs (0x06) in place.
+/// Complete the `rp` (0x02) and `user` (0x03) entities and remove only the
+/// known Firefox `hmac-secret: false` extension input (0x06) in place.
 pub fn complete_make_credential(request: &mut Value) -> Edits {
     let mut edits = Edits::default();
     let Value::Map(entries) = request else {
@@ -45,7 +46,9 @@ pub fn complete_make_credential(request: &mut Value) -> Edits {
             0x06 => {
                 if let Value::Map(extensions) = value {
                     let before = extensions.len();
-                    extensions.retain(|(_, v)| *v != Value::Bool(false));
+                    extensions.retain(|(k, v)| {
+                        !(k.as_text() == Some("hmac-secret") && *v == Value::Bool(false))
+                    });
                     edits.false_extensions_removed = before - extensions.len();
                 }
             }

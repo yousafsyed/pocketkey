@@ -3,14 +3,50 @@
 //! Whenever a site supplies an allowList (login) or excludeList (registration),
 //! Firefox's authenticator-rs first probes the key with `getAssertion`
 //! carrying `options.up = false` and a dummy clientDataHash, keeps only the
-//! credentials the key "confirms", and fails outright if none are confirmed.
+//! credentials the key "confirms". No matches fails a login, but may leave a
+//! registration with an empty exclusion list (which is why probe errors latch).
 //! A phone over the hybrid transport cannot answer a silent request (it closes
 //! the tunnel), so we answer the probe here instead: we confirm every
 //! credential the site itself listed. Nothing is invented, no key material is
-//! involved, and no browser treats a `up=false` assertion as proof of
-//! anything; the real `getAssertion` that follows is forwarded to the phone,
-//! which makes the actual decision. For an excludeList this is the
-//! conservative answer too: Firefox keeps the entry and the phone enforces it.
+//! involved; the real `getAssertion` that follows is forwarded to the phone,
+//! which makes the actual decision. These placeholders are NOT assertions.
+//!
+//! Security depends on the client sending the entire list. Mozilla's
+//! `third_party/rust/authenticator/src/ctap2/preflight.rs`
+//! (`do_credential_list_filtering_ctap2`, gecko-dev/master inspected 2026-11-10)
+//! stops after the FIRST successful count-based chunk. Missing/zero advertised
+//! count means a chunk size of 1, not unlimited. Its transport/hid.rs sends the
+//! serialized command whole (HID packet fragmentation is not list chunking).
+//! We advertise MAX_MSG_SIZE as the count bound: no list fitting our byte limit
+//! can exceed it. The old count of 64 was unsafe for tiny IDs.
+//! See https://github.com/mozilla/gecko-dev/blob/master/third_party/rust/authenticator/src/ctap2/preflight.rs
+//!
+//! Chromium's FilterAndBatchCredentialDescriptors (142.0.7444.59 and main,
+//! inspected 2026-11-10) ignores that count unless maxCredentialIdLength is
+//! positive; omission/zero forces singleton probes. On registration it stops
+//! at the first successful batch too, while login probes keep the REAL hash.
+//! We therefore advertise 65535, the full two-byte attested-ID length range,
+//! not 2048: a smaller advertised bound can silently drop a genuine exclusion.
+//! The actual independent request/frame byte limit remains MAX_MSG_SIZE=2048;
+//! oversized lists/IDs fail, rather than getting filtered into a usable subset.
+//! With both positive hints, ordinary fitting Chromium registrations/logins
+//! take its direct single-batch path, without synthetic probes. Credential-
+//! specific PRF flows can still force silent login probes; real-hash silent
+//! assertions remain unsupported, not replaced with synthetic signatures.
+//! See https://github.com/chromium/chromium/blob/142.0.7444.59/device/fido/make_credential_task.cc
+//! and https://github.com/chromium/chromium/blob/main/device/fido/get_assertion_task.cc
+//!
+//! We reject unexpected silent requests and latch failed/repeated probes in
+//! Ctap2 so Firefox cannot discard a failed probe then create with no exclusions.
+//! HID must also report rejected/abandoned CBOR (including timeouts) through
+//! Ctap2::reject_channel: a 7610..65535-byte probe is rejected before dispatch.
+//! Oversized frames received by CTAP (2049..7609 bytes) and compatibility edits
+//! exceeding the byte limit set the same hard latch. It survives CANCEL
+//! (oversized tails can encode one) and clears only on validated INIT/new
+//! lifecycle via Ctap2::reinitialize_channel.
+//! CHANNEL_BUSY does not reject the active request and must not set this latch.
+//! The compatibility tests exercise the Firefox and Chromium request sequences
+//! described above, including explicit channel reinitialization after errors.
 //!
 //! The synthetic response carries authData `SHA-256(rpId) || flags=0 ||
 //! counter=0` and an empty signature, so it is recognisably not a real
@@ -19,7 +55,9 @@
 use ciborium::Value;
 use sha2::{Digest, Sha256};
 
-use super::status;
+use super::{
+    canonical, status, MAX_CREDENTIAL_COUNT_IN_LIST, MAX_CREDENTIAL_ID_LENGTH, MAX_MSG_SIZE,
+};
 
 /// Outcome of inspecting a getAssertion request.
 #[derive(Debug, PartialEq, Eq)]
@@ -35,7 +73,10 @@ pub enum Probe {
 
 /// Inspect the CBOR map of a getAssertion request (without the command byte).
 pub fn inspect(cbor: &[u8]) -> Probe {
-    let Ok(Value::Map(entries)) = ciborium::from_reader::<Value, _>(cbor) else {
+    if cbor.len() >= MAX_MSG_SIZE as usize {
+        return Probe::Error(status::CTAP2_ERR_REQUEST_TOO_LARGE);
+    }
+    let Some(Value::Map(entries)) = canonical::decode_map(cbor) else {
         return Probe::Error(status::CTAP2_ERR_INVALID_CBOR);
     };
     let field = |key: i64| {
@@ -45,26 +86,64 @@ pub fn inspect(cbor: &[u8]) -> Probe {
             .map(|(_, v)| v)
     };
 
-    let up_requested = match field(0x05) {
-        Some(Value::Map(options)) => options
-            .iter()
-            .find(|(k, _)| k.as_text() == Some("up"))
-            .map(|(_, v)| v.as_bool().unwrap_or(true))
-            .unwrap_or(true),
-        _ => true,
+    let options = match field(5) {
+        Some(Value::Map(options)) => Some(options),
+        None => None,
+        _ => return Probe::Error(status::CTAP2_ERR_INVALID_CBOR),
     };
-    if up_requested {
-        describe_request(&entries, &|k| field(k));
+    if options.is_some_and(|options| {
+        options
+            .iter()
+            .any(|(k, v)| k.as_text().is_none() || !matches!(v, Value::Bool(_)))
+    }) {
+        return Probe::Error(status::CTAP2_ERR_INVALID_CBOR);
+    }
+    let silent = options.is_some_and(|options| {
+        options
+            .iter()
+            .any(|(k, v)| k.as_text() == Some("up") && *v == Value::Bool(false))
+    });
+    if !silent {
         return Probe::NotSilent;
     }
 
-    let Some(Value::Text(rp_id)) = field(0x01) else {
+    // Only the known Mozilla no-PIN, no-UV, no-extension probe is synthetic.
+    // Ordinary silent assertions must never be answered with placeholders.
+    if entries
+        .iter()
+        .any(|(key, _)| !matches!(key, Value::Integer(i) if (1..=5).contains(&i128::from(*i))))
+        || options.is_some_and(|options| {
+            options
+                .iter()
+                .any(|(k, v)| !matches!(k.as_text(), Some("up" | "uv")) || *v != Value::Bool(false))
+        })
+        || field(4).is_some_and(|ext| !matches!(ext, Value::Map(m) if m.is_empty()))
+    {
+        return Probe::Error(status::CTAP2_ERR_OPERATION_DENIED);
+    }
+    let Some(Value::Text(rp_id)) = field(1) else {
         return Probe::Error(status::CTAP2_ERR_MISSING_PARAMETER);
     };
-    let allow_list: Vec<&Value> = match field(0x03) {
-        Some(Value::Array(items)) => items.iter().collect(),
-        _ => Vec::new(),
+    if rp_id.is_empty() || rp_id.len() > 253 || rp_id.chars().any(char::is_control) {
+        return Probe::Error(status::CTAP2_ERR_INVALID_CBOR);
+    }
+    let Some(Value::Bytes(hash)) = field(2) else {
+        return Probe::Error(status::CTAP2_ERR_MISSING_PARAMETER);
     };
+    if hash.as_slice() != Sha256::digest(b"").as_slice() {
+        return Probe::Error(status::CTAP2_ERR_OPERATION_DENIED);
+    }
+    let allow_list = match field(3) {
+        Some(Value::Array(items)) => items.as_slice(),
+        None => &[],
+        _ => return Probe::Error(status::CTAP2_ERR_INVALID_CBOR),
+    };
+    if allow_list.len() > MAX_CREDENTIAL_COUNT_IN_LIST as usize {
+        return Probe::Error(status::CTAP2_ERR_LIMIT_EXCEEDED);
+    }
+    if let Err(code) = validate_descriptors(allow_list) {
+        return Probe::Error(code);
+    }
     if allow_list.is_empty() {
         // Silent discovery of resident credentials: we have none to report.
         return Probe::Assertions(vec![vec![status::CTAP2_ERR_NO_CREDENTIALS]]);
@@ -72,8 +151,8 @@ pub fn inspect(cbor: &[u8]) -> Probe {
 
     let auth_data = placeholder_auth_data(rp_id);
     let total = allow_list.len();
-    let responses = allow_list
-        .into_iter()
+    let responses: Vec<Vec<u8>> = allow_list
+        .iter()
         .enumerate()
         .map(|(i, credential)| {
             let mut map = vec![
@@ -99,62 +178,47 @@ pub fn inspect(cbor: &[u8]) -> Probe {
             out
         })
         .collect();
+    if responses
+        .iter()
+        .any(|response| response.len() > MAX_MSG_SIZE as usize)
+    {
+        return Probe::Error(status::CTAP2_ERR_REQUEST_TOO_LARGE);
+    }
     Probe::Assertions(responses)
 }
 
-/// Debug-log the shape of a request we are about to forward: enough to see
-/// what a phone might object to, without the clientDataHash or credential ids.
-fn describe_request<'a>(entries: &'a [(Value, Value)], field: &dyn Fn(i64) -> Option<&'a Value>) {
-    if !tracing::enabled!(tracing::Level::DEBUG) {
-        return;
+/// Validate before echoing anything. Do not invent missing IDs or types, and
+/// do not echo arbitrary descriptor fields into synthetic responses.
+fn validate_descriptors(items: &[Value]) -> Result<(), u8> {
+    for item in items {
+        let Value::Map(fields) = item else {
+            return Err(status::CTAP2_ERR_INVALID_CBOR);
+        };
+        let get = |name: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k.as_text() == Some(name))
+                .map(|(_, v)| v)
+        };
+        if !matches!(get("type"), Some(Value::Text(ty)) if ty == "public-key") {
+            return Err(status::CTAP2_ERR_INVALID_CBOR);
+        }
+        let Some(Value::Bytes(id)) = get("id") else {
+            return Err(status::CTAP2_ERR_INVALID_CBOR);
+        };
+        if id.is_empty() || id.len() > MAX_CREDENTIAL_ID_LENGTH as usize {
+            return Err(status::CTAP2_ERR_LIMIT_EXCEEDED);
+        }
+        for (key, value) in fields {
+            match key.as_text() {
+                Some("id" | "type") => {}
+                Some("transports") if matches!(value, Value::Array(items) if items.len() <= 8 && items.iter().all(|item| matches!(item.as_text(), Some("usb" | "nfc" | "ble" | "internal" | "hybrid" | "cable" | "smart-card")))) =>
+                    {}
+                _ => return Err(status::CTAP2_ERR_INVALID_CBOR),
+            }
+        }
     }
-    let rp_id = field(0x01).and_then(|v| v.as_text()).unwrap_or("?");
-    let allow: Vec<usize> = match field(0x03) {
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|c| match c {
-                Value::Map(f) => f
-                    .iter()
-                    .find(|(k, _)| k.as_text() == Some("id"))
-                    .and_then(|(_, v)| v.as_bytes())
-                    .map_or(0, |b| b.len()),
-                _ => 0,
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    let transports: Vec<String> = match field(0x03) {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|c| match c {
-                Value::Map(f) => f
-                    .iter()
-                    .find(|(k, _)| k.as_text() == Some("transports"))
-                    .map(|(_, v)| format!("{v:?}")),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    let extensions: Vec<String> = match field(0x04) {
-        Some(Value::Map(f)) => f
-            .iter()
-            .filter_map(|(k, _)| k.as_text().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    };
-    let options = field(0x05).map(|v| format!("{v:?}")).unwrap_or_default();
-    let keys: Vec<String> = entries.iter().map(|(k, _)| format!("{k:?}")).collect();
-    tracing::debug!(
-        rp_id,
-        allow_list_id_lengths = ?allow,
-        allow_list_transports = ?transports,
-        ?extensions,
-        %options,
-        has_pin_uv_auth = field(0x06).is_some(),
-        ?keys,
-        "getAssertion request to forward"
-    );
+    Ok(())
 }
 
 /// `rpIdHash || flags || signCount` with no flags set and a zero counter.
@@ -166,24 +230,16 @@ fn placeholder_auth_data(rp_id: &str) -> [u8; 37] {
 
 /// Echo the site's credential descriptor back with just `id` and `type`.
 fn credential_descriptor(descriptor: &Value) -> Value {
-    let (id, ty) = match descriptor {
-        Value::Map(fields) => {
-            let get = |name: &str| {
-                fields
-                    .iter()
-                    .find(|(k, _)| k.as_text() == Some(name))
-                    .map(|(_, v)| v.clone())
-            };
-            (
-                get("id").unwrap_or(Value::Bytes(Vec::new())),
-                get("type").unwrap_or(Value::Text("public-key".into())),
-            )
-        }
-        _ => (Value::Bytes(Vec::new()), Value::Text("public-key".into())),
-    };
+    let fields = descriptor.as_map().expect("descriptor was validated");
+    let id = fields
+        .iter()
+        .find(|(key, _)| key.as_text() == Some("id"))
+        .expect("descriptor ID was validated")
+        .1
+        .clone();
     Value::Map(vec![
         (Value::Text("id".into()), id),
-        (Value::Text("type".into()), ty),
+        (Value::Text("type".into()), Value::Text("public-key".into())),
     ])
 }
 
@@ -194,7 +250,10 @@ mod tests {
     fn request(rp_id: &str, allow: &[&[u8]], up: Option<bool>) -> Vec<u8> {
         let mut map = vec![
             (Value::Integer(0x01.into()), Value::Text(rp_id.into())),
-            (Value::Integer(0x02.into()), Value::Bytes(vec![0xAA; 32])),
+            (
+                Value::Integer(0x02.into()),
+                Value::Bytes(Sha256::digest(b"").to_vec()),
+            ),
         ];
         if !allow.is_empty() {
             map.push((

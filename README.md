@@ -41,9 +41,9 @@ Firefox ──hidraw──▶ /dev/uhid ──▶ pocketkey ──BLE + wss tunn
    (Firefox writes some maps out of order and Android rejects those), and
    for registration the display labels Firefox leaves out are filled in
    (`rp.name` = `rp.id`, `user.displayName` = `user.name`; iPhones reject a
-   request without them) while `false` extension inputs are dropped. Values
-   such as `clientDataHash`, ids, algorithms and options are preserved
-   exactly. pocketkey never sees or stores a private key.
+   request without them) while the legacy `hmac-secret: false` input is dropped.
+   Other extension values, `clientDataHash`, ids, algorithms and options are
+   preserved exactly. pocketkey never sees or stores a passkey private key.
 4. If the phone sends linking data after a QR session, pocketkey stores it so
    the next request needs no QR. Several phones can be linked. (Current
    Android/Google Password Manager phones do not send it; see "Use".)
@@ -112,25 +112,41 @@ different device" if asked. The pocketkey window appears:
   retired phone linking in 2024 in favour of passkey sync), so expect a QR
   code every time with such phones.
 
-Cancel from the window, from Firefox's dialog, or on the phone.
+Cancel from the window, from Firefox's dialog, or on the phone. If the browser
+asks you to select an authenticator, click **Use this phone-backed key** in the
+pocketkey window; selection no longer happens automatically.
 
 ## Security notes
 
 - pocketkey is a **proxy**. Origin and RP ID checks, challenge binding and
   user verification happen in the browser and on the phone exactly as with a
-  real security key plus a real hybrid session. pocketkey does not parse or
-  modify credentials, `clientDataHash`, or attestation.
-- Nothing secret about your accounts is stored on the PC. The **linking data**
+  real security key plus a real hybrid session. pocketkey validates CTAP
+  structure but does not alter credential IDs, `clientDataHash`, signatures or
+  attestation values in forwarded operations.
+- Passkey private keys stay on the phone. The **linking data**
   (`~/.local/share/pocketkey/linked_devices.cbor`, mode 0600) is sensitive in
   a different way: whoever holds it can make your phone pop up a passkey
-  prompt without a QR scan. The phone still requires your biometrics. Delete
-  the file to unlink all phones (or unlink from the phone's passkey settings).
+  prompt without a QR scan. The phone still requires your biometrics. To
+  reliably unlink all phones, **stop pocketkey, delete the file, then start
+  pocketkey** (or unlink from the phone's passkey settings). Deletion is also
+  noticed by a running daemon before subsequent lookups and old records are
+  not rewritten. However, deletion cannot revoke an already-running connection
+  or reliably prevent an in-flight callback from linking a phone again.
+  Corrupt or unsafe stores fail startup rather than being overwritten; limits
+  are 128 phones and 1 MiB. The store directory must be owned by your user and
+  private (0700), with the file private (0600).
 - The install loads the `uhid` kernel module at boot and the udev rule grants
   the active desktop session access to `/dev/uhid`, i.e.
   any program in your session may create virtual input devices. That is
   the trade-off for running without root.
-- Logs never include request payloads, credential IDs or linking secrets at
-  `info` level. `RUST_LOG=debug` adds lengths and state transitions, not data.
+- Pocketkey's own request/response diagnostics use allowlisted metadata rather
+  than raw CBOR values. Detailed logging is scoped to Pocketkey; dependency
+  logs stay at `info` or below even with `RUST_LOG=trace`. Treat logs as private
+  and review diagnostic bundles before sharing them.
+- Local programs with access to the virtual hidraw device can submit requests.
+  HID channel IDs multiplex clients; they are not an authorization boundary.
+  Resource limits prevent unbounded channel allocation, but a malicious local
+  client can still compete with legitimate requests.
 
 ## Limitations
 
@@ -142,11 +158,19 @@ Cancel from the window, from Firefox's dialog, or on the phone.
   empty signature, nothing signed or invented) and the phone then decides on
   the real request. Consequence: if none of the listed credentials is on your
   phone, you find out on the phone instead of Firefox saying so up front.
+  The workaround recognizes Firefox's specific dummy-challenge probe, prevents
+  count-based list splitting for requests within the 2048-byte limit, and
+  rejects observed incomplete/failed exclusion sequences. The advertised
+  credential-ID bound prevents Chromium from switching to singleton probes;
+  the actual request-byte limit remains 2048. Oversized/incomplete CBOR
+  received by the proxy blocks credential operations until channel
+  reinitialization. This compatibility behavior is tested against Firefox and
+  Chromium; other clients may behave differently.
 - No U2F/CTAP1, no PIN, no credential management, no NFC. `getNextAssertion`
   is only served for the local pre-flight answer above; phones return a
   single assertion.
 - Only the cloud-assisted tunnel (caBLE v2) is advertised in the QR for
-  compatibility with current Android builds; direct BLE L2CAP is not used.
+  compatibility with current Android builds.
 
 ## Troubleshooting
 
@@ -174,13 +198,19 @@ cargo run --example hidclient            # INIT + getInfo + PING through hidraw
 ## Development
 
 ```sh
-cargo test                                  # unit tests (CTAPHID state machine, getInfo, store, uhid layout)
-cargo clippy --all-targets -- -D warnings
+cargo test --locked                         # application and security regressions
+cargo test --locked --release               # optimized-build regressions
+cargo clippy --locked --all-targets -- -D warnings
 cargo run --example ui_demo                 # exercise the window without a phone
 ```
 
+Dependencies come from upstream Git/crates.io sources and are resolved in
+`Cargo.lock`. CI runs Pocketkey's application tests, including optimized-build
+regressions. Dependency updates should be reviewed and tested with both phone
+platforms before release.
+
 Layout: `src/uhid.rs` (kernel interface), `src/ctaphid.rs` (pure transport
-state machine), `src/ctap2.rs` (command dispatch and getInfo),
+state machine), `src/ctap2/` (command dispatch and getInfo),
 `src/hybrid/` (phone transport over `pxp`, linked-device store), `src/ui.rs`
 (egui window), `src/main.rs` (wiring). See `PLAN.md` for design decisions and
 `TESTING.md` for the manual test plan.

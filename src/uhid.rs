@@ -116,6 +116,11 @@ mod set_report_reply {
 /// `rtype` value for output reports in `UHID_OUTPUT` / `UHID_SET_REPORT`.
 const UHID_OUTPUT_REPORT: u8 = 1;
 
+/// Bound each polling turn even when the fd stays readable with events that
+/// are discarded or answered internally. AsyncFd readiness alone is not a
+/// guaranteed scheduling point for timers and cancellation.
+const EVENTS_PER_YIELD: usize = 16;
+
 /// Events from the kernel that the caller cares about.
 #[derive(Debug)]
 pub enum UhidEvent {
@@ -183,7 +188,13 @@ impl UhidDevice {
     /// Wait for the next event that matters to the caller. `UHID_START` and
     /// report queries are handled internally.
     pub async fn next_event(&mut self) -> io::Result<UhidEvent> {
+        let mut processed = 0;
         loop {
+            if processed == EVENTS_PER_YIELD {
+                tokio::task::yield_now().await;
+                processed = 0;
+            }
+            processed += 1;
             let mut buf = [0u8; UHID_EVENT_SIZE];
             let n = loop {
                 let mut guard = self.fd.readable_mut().await?;
@@ -402,6 +413,73 @@ mod tests {
             &ev[create2::RD_DATA..create2::RD_DATA + 34],
             &FIDO_REPORT_DESCRIPTOR
         );
+    }
+
+    #[tokio::test]
+    async fn next_event_yields_when_discarding_or_answering_queries() {
+        use std::future::Future;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+        use std::task::{Context, Waker};
+
+        // Datagrams preserve the event boundaries of /dev/uhid without needing
+        // a real device, kernel module, elevated privileges, or system changes.
+        for event_type in [UHID_OUTPUT, UHID_GET_REPORT, UHID_SET_REPORT] {
+            let (reader, writer) = UnixDatagram::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            let owned: OwnedFd = reader.into();
+            let file = File::from(owned);
+            // SAFETY: this AsyncFd exclusively owns the open descriptor.
+            let fd = unsafe { AsyncFd::register(file).unwrap() };
+            let mut device = UhidDevice {
+                fd,
+                // It is a test socket, not a real device to destroy on drop.
+                destroyed: true,
+            };
+
+            let mut event = [0u8; UHID_EVENT_SIZE];
+            event[..4].copy_from_slice(&event_type.to_le_bytes());
+            // OUTPUT has the wrong type; SET_REPORT has no valid report.
+            // Keep the outgoing request datagrams short where possible.
+            let len = match event_type {
+                UHID_OUTPUT => output::RTYPE + 1,
+                UHID_GET_REPORT => get_report::ID + 4,
+                _ => set_report::DATA,
+            };
+            writer.set_nonblocking(true).unwrap();
+            for _ in 0..EVENTS_PER_YIELD {
+                writer.send(&event[..len]).unwrap();
+            }
+            writer.send(&UHID_STOP.to_le_bytes()).unwrap();
+
+            // Preload all events and wait for readiness first, so the only
+            // scheduling point is the explicit budget, not an empty socket.
+            // A no-op waker lets us observe Pending, then await normally again.
+            let mut cx = Context::from_waker(Waker::noop());
+            drop(device.fd.readable().await.unwrap());
+            let mut next = Box::pin(device.next_event());
+            let first_poll = next.as_mut().poll(&mut cx);
+            assert!(
+                first_poll.is_pending(),
+                "must yield before the trailing STOP"
+            );
+            assert!(matches!(next.await.unwrap(), UhidEvent::Stop));
+            if event_type != UHID_OUTPUT {
+                for _ in 0..EVENTS_PER_YIELD {
+                    let mut reply = [0u8; UHID_EVENT_SIZE];
+                    assert_eq!(writer.recv(&mut reply).unwrap(), UHID_EVENT_SIZE);
+                    let reply_type = u32::from_le_bytes(reply[..4].try_into().unwrap());
+                    assert_eq!(
+                        reply_type,
+                        if event_type == UHID_GET_REPORT {
+                            UHID_GET_REPORT_REPLY
+                        } else {
+                            UHID_SET_REPORT_REPLY
+                        }
+                    );
+                }
+            }
+        }
     }
 
     #[test]

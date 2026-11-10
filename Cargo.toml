@@ -22,7 +22,7 @@ thiserror = "2"
 anyhow = "1"
 async-trait = "0.1"
 
-# Hybrid transport (caBLE / PXP) from the libwebauthn project, pinned.
+# Upstream hybrid transport, pinned; no local library fork.
 pxp = { git = "https://github.com/linux-credentials/libwebauthn", tag = "pxp-v0.1.0" }
 # Only used to discover whether a Bluetooth adapter exists; already a pxp dependency.
 btleplug = "0.11.7"
@@ -43,6 +43,7 @@ vendored-dbus = ["dbus/vendored"]
 
 [dev-dependencies]
 hex = "0.4"
+tokio = { version = "1.45", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

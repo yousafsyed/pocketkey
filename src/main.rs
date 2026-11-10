@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{filter, prelude::*, EnvFilter};
 
 use pocketkey::ctaphid::{self, Event, KeepaliveStatus, RequestId};
 use pocketkey::hybrid::pxp_transport::PxpTransport;
@@ -29,12 +29,22 @@ use pocketkey::uhid::{self, UhidDevice, UhidEvent};
 use pocketkey::{ctap2, ui};
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(100);
+const SELECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A forwarded request currently running on the hybrid transport.
 struct Active {
     id: RequestId,
     task: JoinHandle<Result<Vec<u8>, HybridError>>,
     cancel: CancellationToken,
+    selection: Option<oneshot::Sender<()>>,
+    progress: Option<watch::Receiver<Status>>,
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.task.abort();
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -45,9 +55,13 @@ fn main() -> anyhow::Result<()> {
         println!("pocketkey {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_filter(filter::filter_fn(allow_diagnostic))
+                .with_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+                ),
         )
         .init();
 
@@ -71,26 +85,33 @@ fn main() -> anyhow::Result<()> {
     info!(name = uhid::DEVICE_NAME, "virtual FIDO2 key ready");
 
     let (status_tx, status_rx) = watch::channel(Status::Idle);
-    let (ui_cancel_tx, ui_cancel_rx) = mpsc::unbounded_channel();
-    let mut daemon = runtime.spawn(run(device, transport, status_tx, ui_cancel_rx));
+    let (request_tx, request_rx) = watch::channel(None);
+    let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
+    let mut daemon = runtime.spawn(run(device, transport, status_tx, request_tx, ui_action_rx));
 
-    // Main thread: show the window whenever a request leaves Idle.
+    // Main thread: show one window per active request identity.
     let mut ui_available =
         std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
     if !ui_available {
         warn!("no WAYLAND_DISPLAY/DISPLAY: running without a window; QR flows cannot be shown");
     }
-    let mut ui_status = status_rx.clone();
+    let mut ui_request = request_rx.clone();
+    let mut shown_request = None;
     let result = loop {
-        // Wait for a request to start, or for the daemon to end.
+        // Request identities, rather than transient status updates, control
+        // window lifetime. A terminal status remains available for the UI to
+        // render, and a stale window cannot select/cancel the next request.
         let finished = runtime.block_on(async {
             loop {
+                let current = *ui_request.borrow_and_update();
+                if current.is_some() && current != shown_request {
+                    shown_request = current;
+                    return None;
+                }
                 tokio::select! {
                     res = &mut daemon => return Some(res),
-                    changed = ui_status.changed() => {
-                        // The sender lives in the daemon task; a closed channel means it is exiting.
+                    changed = ui_request.changed() => {
                         if changed.is_err() { return Some((&mut daemon).await); }
-                        if !matches!(*ui_status.borrow_and_update(), Status::Idle) { return None; }
                     }
                 }
             }
@@ -99,25 +120,15 @@ fn main() -> anyhow::Result<()> {
             break res;
         }
         if ui_available {
-            if let Err(e) = ui::show(status_rx.clone(), ui_cancel_tx.clone()) {
+            if let Err(e) = ui::show(
+                status_rx.clone(),
+                ui_action_tx.clone(),
+                request_rx.clone(),
+                shown_request.expect("selected a request"),
+            ) {
                 error!(error = %e, "could not open the request window; continuing without one");
                 ui_available = false;
             }
-        }
-        // Do not reopen until this request is over.
-        let finished = runtime.block_on(async {
-            loop {
-                tokio::select! {
-                    res = &mut daemon => return Some(res),
-                    changed = ui_status.changed() => {
-                        if changed.is_err() { return Some((&mut daemon).await); }
-                        if matches!(*ui_status.borrow_and_update(), Status::Idle) { return None; }
-                    }
-                }
-            }
-        });
-        if let Some(res) = finished {
-            break res;
         }
     };
 
@@ -131,9 +142,19 @@ async fn run(
     mut device: UhidDevice,
     transport: Arc<dyn HybridTransport>,
     status_tx: watch::Sender<Status>,
-    mut ui_cancel_rx: mpsc::UnboundedReceiver<()>,
+    request_tx: watch::Sender<Option<RequestId>>,
+    mut ui_action_rx: mpsc::UnboundedReceiver<ui::Action>,
 ) -> anyhow::Result<()> {
-    let result = event_loop(&mut device, transport, &status_tx, &mut ui_cancel_rx).await;
+    let result = event_loop(
+        &mut device,
+        transport,
+        &status_tx,
+        &request_tx,
+        &mut ui_action_rx,
+    )
+    .await;
+    let _ = status_tx.send(Status::Idle);
+    let _ = request_tx.send(None);
     // Always tear the device down so clients do not see a stale hidraw node.
     if let Err(e) = device.destroy() {
         warn!(error = %e, "destroying uhid device");
@@ -145,7 +166,8 @@ async fn event_loop(
     device: &mut UhidDevice,
     transport: Arc<dyn HybridTransport>,
     status_tx: &watch::Sender<Status>,
-    ui_cancel_rx: &mut mpsc::UnboundedReceiver<()>,
+    request_tx: &watch::Sender<Option<RequestId>>,
+    ui_action_rx: &mut mpsc::UnboundedReceiver<ui::Action>,
 ) -> anyhow::Result<()> {
     let mut hid = ctaphid::Transport::new().with_version(crate_version_bytes());
     let mut ctap = ctap2::Ctap2::new();
@@ -162,7 +184,7 @@ async fn event_loop(
                         let out = hid.handle_report(&report, Instant::now());
                         send_all(device, &out.reports)?;
                         for ev in out.events {
-                            handle_event(ev, &mut hid, &mut ctap, &mut active, &transport, status_tx, device)?;
+                            handle_event(ev, &mut hid, &mut ctap, &mut active, &transport, status_tx, request_tx, device)?;
                         }
                     }
                     UhidEvent::Open => debug!("hidraw node opened by a client"),
@@ -175,8 +197,20 @@ async fn event_loop(
             }
 
             _ = ticker.tick() => {
-                send_all(device, &hid.tick(Instant::now()))?;
-                if let Some(a) = &active {
+                let expired = hid.tick_output(Instant::now());
+                send_all(device, &expired.reports)?;
+                for event in expired.events {
+                    handle_event(event, &mut hid, &mut ctap, &mut active, &transport, status_tx, request_tx, device)?;
+                }
+                if let Some(a) = &mut active {
+                    if let Some(progress) = &mut a.progress {
+                        let next = progress.borrow_and_update().clone();
+                        status_tx.send_if_modified(|current| {
+                            if *current == next { return false; }
+                            *current = next;
+                            true
+                        });
+                    }
                     let status = if status_tx.borrow().user_action_pending() {
                         KeepaliveStatus::UpNeeded
                     } else {
@@ -192,6 +226,11 @@ async fn event_loop(
                 if active.is_some() =>
             {
                 let a = active.take().expect("checked");
+                let result = if a.cancel.is_cancelled() {
+                    Ok(Err(HybridError::Cancelled))
+                } else {
+                    result
+                };
                 let payload = match result {
                     Ok(Ok(bytes)) => {
                         info!(status = bytes.first().copied().unwrap_or(0), "phone replied");
@@ -208,13 +247,24 @@ async fn event_loop(
                     }
                 };
                 send_all(device, &hid.respond(a.id, &payload))?;
-                let _ = status_tx.send(Status::Idle);
+                let _ = status_tx.send(completion_status(&payload));
+                let _ = request_tx.send(None);
             }
 
-            Some(()) = ui_cancel_rx.recv() => {
-                if let Some(a) = &active {
-                    info!("request cancelled from the window");
-                    a.cancel.cancel();
+            Some(action) = ui_action_rx.recv() => {
+                if let Some(a) = &mut active {
+                    match action {
+                        ui::Action::Cancel { request } if request == a.id => {
+                            info!("request cancelled from the window");
+                            a.cancel.cancel();
+                        }
+                        ui::Action::Select { request } if request == a.id => {
+                            if let Some(selected) = a.selection.take() {
+                                let _ = selected.send(());
+                            }
+                        }
+                        _ => debug!("ignoring action from a stale request window"),
+                    }
                 }
             }
 
@@ -228,6 +278,7 @@ async fn event_loop(
         a.task.abort();
     }
     let _ = status_tx.send(Status::Idle);
+    let _ = request_tx.send(None);
     Ok(())
 }
 
@@ -239,16 +290,17 @@ fn handle_event(
     active: &mut Option<Active>,
     transport: &Arc<dyn HybridTransport>,
     status_tx: &watch::Sender<Status>,
+    request_tx: &watch::Sender<Option<RequestId>>,
     device: &mut UhidDevice,
 ) -> anyhow::Result<()> {
     match ev {
-        Event::CborRequest { id, payload } => {
+        Event::CborRequest { id, cid, payload } => {
             debug!(
                 cmd = payload.first().copied().unwrap_or(0),
                 len = payload.len(),
                 "CTAP2 request"
             );
-            match ctap.dispatch(&payload) {
+            match ctap.dispatch_on_channel(cid, &payload, Instant::now()) {
                 ctap2::Disposition::Respond(bytes) => send_all(device, &hid.respond(id, &bytes))?,
                 ctap2::Disposition::Forward { hint, frame } => {
                     if active.is_some() {
@@ -258,26 +310,91 @@ fn handle_event(
                         return Ok(());
                     }
                     info!(?hint, "forwarding request to the phone");
+                    let _ = status_tx.send(Status::Starting);
+                    let _ = request_tx.send(Some(id));
                     let cancel = CancellationToken::new();
+                    // Give each task its own progress channel. The event loop
+                    // alone publishes UI state, so a cancelled task cannot
+                    // overwrite a later request's status.
+                    let (progress_tx, progress_rx) = watch::channel(Status::Starting);
                     let task = tokio::spawn({
                         let transport = Arc::clone(transport);
                         let cancel = cancel.clone();
-                        let status_tx = status_tx.clone();
-                        async move { transport.ctap(frame, hint, status_tx, cancel).await }
+                        async move { transport.ctap(frame, hint, progress_tx, cancel).await }
                     });
-                    *active = Some(Active { id, task, cancel });
+                    *active = Some(Active {
+                        id,
+                        task,
+                        cancel,
+                        selection: None,
+                        progress: Some(progress_rx),
+                    });
+                }
+                ctap2::Disposition::Select => {
+                    if active.is_some() {
+                        send_all(device, &hid.respond(id, &[ctap2::status::CTAP1_ERR_OTHER]))?;
+                        return Ok(());
+                    }
+                    let cancel = CancellationToken::new();
+                    let (selected, selection_rx) = oneshot::channel();
+                    let _ = status_tx.send(Status::Selecting);
+                    let _ = request_tx.send(Some(id));
+                    let task = tokio::spawn(wait_for_selection(selection_rx, cancel.clone()));
+                    *active = Some(Active {
+                        id,
+                        task,
+                        cancel,
+                        selection: Some(selected),
+                        progress: None,
+                    });
                 }
             }
         }
-        Event::Cancel { id } => match active {
-            Some(a) if a.id == id => {
+        Event::Cancel { id } => {
+            if active.as_ref().is_some_and(|a| a.id == id) {
                 info!("client cancelled the request");
+                let a = active.take().expect("matched active request");
                 a.cancel.cancel();
+                a.task.abort();
+                send_all(
+                    device,
+                    &hid.respond(id, &[ctap2::status::CTAP2_ERR_KEEPALIVE_CANCEL]),
+                )?;
+                let _ = status_tx.send(Status::Idle);
+                let _ = request_tx.send(None);
             }
-            _ => debug!("cancel for a request that is not active"),
-        },
+        }
+        Event::Reset { cid } => ctap.reset_channel(cid),
+        Event::Reinitialized { cid } => ctap.reinitialize_channel(cid),
+        Event::RejectedCbor { cid } => ctap.reject_channel(cid),
     }
     Ok(())
+}
+
+async fn wait_for_selection(
+    selected: oneshot::Receiver<()>,
+    cancel: CancellationToken,
+) -> Result<Vec<u8>, HybridError> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(HybridError::Cancelled),
+        result = tokio::time::timeout(SELECTION_TIMEOUT, selected) => match result {
+            Ok(Ok(())) => Ok(vec![ctap2::status::OK]),
+            Ok(Err(_)) => Err(HybridError::Cancelled),
+            Err(_) => Err(HybridError::Timeout),
+        },
+    }
+}
+
+fn completion_status(payload: &[u8]) -> Status {
+    match payload.first().copied() {
+        Some(ctap2::status::OK) => Status::Done,
+        Some(ctap2::status::CTAP2_ERR_KEEPALIVE_CANCEL) => Status::Idle,
+        Some(code) => Status::Failed(format!(
+            "The operation did not complete (CTAP status 0x{code:02x})."
+        )),
+        None => Status::Failed("The authenticator returned an empty response.".into()),
+    }
 }
 
 fn send_all(device: &mut UhidDevice, reports: &[ctaphid::Report]) -> anyhow::Result<()> {
@@ -289,6 +406,14 @@ fn send_all(device: &mut UhidDevice, reports: &[ctaphid::Report]) -> anyhow::Res
     Ok(())
 }
 
+/// Keep detailed diagnostics scoped to our allowlisted application log sites.
+/// RUST_LOG may narrow this policy, but cannot enable dependency debug/trace.
+fn allow_diagnostic(metadata: &tracing::Metadata<'_>) -> bool {
+    metadata.target() == "pocketkey"
+        || metadata.target().starts_with("pocketkey::")
+        || *metadata.level() <= tracing::Level::INFO
+}
+
 /// (major, minor, patch) of this crate, reported in the CTAPHID INIT response.
 fn crate_version_bytes() -> [u8; 3] {
     let parse = |s: &str| s.parse::<u8>().unwrap_or(0);
@@ -297,4 +422,130 @@ fn crate_version_bytes() -> [u8; 3] {
         parse(env!("CARGO_PKG_VERSION_MINOR")),
         parse(env!("CARGO_PKG_VERSION_PATCH")),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependency_diagnostics_stay_capped_with_verbose_environment_filter() {
+        use std::io::{self, Write};
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Capture(captured.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || sink.clone())
+                .with_filter(filter::filter_fn(allow_diagnostic))
+                .with_filter(EnvFilter::new("trace,pxp=trace,tungstenite=trace")),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "pxp::protocol", "dependency-debug-sentinel");
+            tracing::trace!(target: "tungstenite::protocol", "dependency-trace-sentinel");
+            tracing::trace!(target: "pocketkey_other", "non-application-sentinel");
+            tracing::info!(target: "pxp::protocol", "dependency-info-visible");
+            tracing::debug!(target: "pocketkey::ctap2", "application-debug-visible");
+            tracing::trace!(target: "pocketkey", "application-trace-visible");
+        });
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains("dependency-debug-sentinel"));
+        assert!(!output.contains("dependency-trace-sentinel"));
+        assert!(!output.contains("non-application-sentinel"));
+        assert!(output.contains("dependency-info-visible"));
+        assert!(output.contains("application-debug-visible"));
+        assert!(output.contains("application-trace-visible"));
+    }
+
+    #[test]
+    fn ctap_errors_are_not_presented_as_success() {
+        assert_eq!(completion_status(&[0]), Status::Done);
+        assert_eq!(completion_status(&[0x2d]), Status::Idle);
+        assert!(matches!(completion_status(&[0x27]), Status::Failed(_)));
+        assert!(matches!(completion_status(&[]), Status::Failed(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selection_times_out_without_a_click() {
+        let (_tx, rx) = oneshot::channel();
+        let task = tokio::spawn(wait_for_selection(rx, CancellationToken::new()));
+        tokio::task::yield_now().await;
+        tokio::time::advance(SELECTION_TIMEOUT).await;
+        assert_eq!(task.await.unwrap(), Err(HybridError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn selection_requires_explicit_approval() {
+        let (tx, rx) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(wait_for_selection(rx, cancel));
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "selection must not succeed automatically"
+        );
+        tx.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), vec![ctap2::status::OK]);
+    }
+
+    fn request_id() -> RequestId {
+        let mut hid = ctaphid::Transport::new();
+        let init = ctaphid::fragment(ctaphid::BROADCAST_CID, ctaphid::cmd::INIT, &[0; 8]);
+        let response = hid.handle_report(&init[0], Instant::now());
+        let cid = u32::from_be_bytes(response.reports[0][15..19].try_into().unwrap());
+        let request = ctaphid::fragment(cid, ctaphid::cmd::CBOR, &[ctap2::command::SELECTION]);
+        let event = hid.handle_report(&request[0], Instant::now());
+        match event.events[0] {
+            Event::CborRequest { id, .. } => id,
+            _ => panic!("expected a request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_active_cancels_and_aborts_even_on_error_paths() {
+        let cancel = CancellationToken::new();
+        let observed_cancel = cancel.clone();
+        let task = tokio::spawn(std::future::pending::<Result<Vec<u8>, HybridError>>());
+        let abort = task.abort_handle();
+        let active = Active {
+            id: request_id(),
+            task,
+            cancel,
+            selection: None,
+            progress: None,
+        };
+        drop(active);
+        assert!(observed_cancel.is_cancelled());
+        tokio::task::yield_now().await;
+        assert!(
+            abort.is_finished(),
+            "a dropped JoinHandle must not detach a live tunnel"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_over_selection() {
+        let (tx, rx) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        tx.send(()).unwrap();
+        cancel.cancel();
+        assert_eq!(
+            wait_for_selection(rx, cancel).await,
+            Err(HybridError::Cancelled)
+        );
+    }
 }

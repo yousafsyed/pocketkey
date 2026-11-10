@@ -11,15 +11,47 @@
 //! then bytewise). Values are untouched: clientDataHash, credential ids and
 //! all other bytes are preserved exactly; only key order can change.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, io::Cursor};
 
 use ciborium::Value;
 
-/// Re-encode `cbor` canonically. Returns `None` if it is not valid CBOR, in
-/// which case callers should forward the original bytes unchanged.
+/// Decode exactly one bounded CTAP map. Reject trailing items and duplicate
+/// keys at every depth before any inspection or compatibility transformation.
+/// CTAP map keys are integers or text; rejecting other key types also avoids
+/// ambiguous equality for compound keys, floats and tagged keys.
+pub fn decode_map(cbor: &[u8]) -> Option<Value> {
+    if cbor.len() > super::MAX_MSG_SIZE as usize {
+        return None;
+    }
+    let mut reader = Cursor::new(cbor);
+    let value: Value = ciborium::de::from_reader_with_recursion_limit(&mut reader, 32).ok()?;
+    if reader.position() != cbor.len() as u64
+        || !matches!(value, Value::Map(_))
+        || !valid_maps(&value)
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn valid_maps(value: &Value) -> bool {
+    match value {
+        Value::Map(entries) => entries.iter().enumerate().all(|(i, (key, value))| {
+            matches!(key, Value::Integer(_) | Value::Text(_))
+                && !entries[..i].iter().any(|(previous, _)| previous == key)
+                && valid_maps(value)
+        }),
+        Value::Array(items) => items.iter().all(valid_maps),
+        // Tags and floats are not part of CTAP's CBOR subset.
+        Value::Tag(_, _) | Value::Float(_) => false,
+        _ => true,
+    }
+}
+
+/// Re-encode a strict, single CTAP map canonically. Never forward a failed
+/// decode unchanged: that could make the phone interpret a different request.
 pub fn canonicalize(cbor: &[u8]) -> Option<Vec<u8>> {
-    let value: Value = ciborium::from_reader(cbor).ok()?;
-    Some(encode_canonical(value))
+    Some(encode_canonical(decode_map(cbor)?))
 }
 
 /// Encode an already decoded item with every map in canonical key order.
