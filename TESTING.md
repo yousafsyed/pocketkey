@@ -45,6 +45,10 @@ Verified 2026-11-09 with Android (Google Password Manager) and iPhone
 `rp.name`/`user.displayName` fill-in in `src/ctap2/compat.rs`; without it the
 phone closes the tunnel without replying.
 
+Re-verified 2026-11-10 on webauthn.io (registration and sign-in, both
+phones) with the device created by the privileged `pocketkey-uhid-helper`
+instead of a session-accessible `/dev/uhid`, installed from the `.deb`.
+
 | # | Step | Expect |
 |---|------|--------|
 | 4.1 | webauthn.io, new username, Register, choose security key | QR; phone offers to save the passkey in Google Password Manager |
