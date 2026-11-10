@@ -27,6 +27,12 @@ override_dh_auto_install:
 	install -d debian/pocketkey/usr/lib/systemd/user/default.target.wants
 	ln -s ../pocketkey.service debian/pocketkey/usr/lib/systemd/user/default.target.wants/pocketkey.service
 
+# The helper is socket-activated only: enable/start the socket, never start
+# the service directly (it exits if LISTEN_FDS is unset).
+override_dh_installsystemd:
+	dh_installsystemd pocketkey-uhid.socket
+	dh_installsystemd --no-enable --no-start pocketkey-uhid.service
+
 override_dh_auto_clean:
 	cargo clean
 	rm -rf debian/cargo_home
