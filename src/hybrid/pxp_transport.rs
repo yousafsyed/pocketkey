@@ -33,6 +33,11 @@ pub const LINKED_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for the phone's reply once the request has been sent.
 /// Covers the user unlocking the phone and doing biometrics.
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Bound the entire operation, including Bluetooth setup, linked-device
+/// preparation, sending, and shutdown (not just individual receive calls).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(420);
+const LINKED_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct PxpTransport {
     store: Arc<FileStore>,
@@ -66,7 +71,12 @@ impl PxpTransport {
         status: &watch::Sender<Status>,
         cancel: &CancellationToken,
     ) -> Result<Option<(TunnelHandle, PxpKnownDeviceId)>, HybridError> {
-        for (id, stored) in self.store.list() {
+        for (id, _) in self.store.list() {
+            // A user may unlink phones while an earlier linked attempt waits.
+            // Re-read each record immediately before using it.
+            let Some(stored) = self.store.get(&id) else {
+                continue;
+            };
             let Some(info) = stored.to_info() else {
                 warn!(name = %stored.name, "linked phone record is malformed; skipping");
                 continue;
@@ -74,12 +84,22 @@ impl PxpTransport {
             info!(name = %info.name, "contacting linked phone");
             let _ = status.send(Status::LinkedWaitingForPhone {
                 name: info.name.clone(),
+                hint,
             });
-            let device = PxpKnownDevice::new(hint.into(), &info, self.store.clone())
-                .await
-                .map_err(|e| HybridError::Transport(format!("preparing linked connection: {e}")))?;
-            let tunnel = pxp::connect(device, StatusSink(status.clone()));
-            match wait_connected(tunnel, LINKED_TIMEOUT, cancel).await {
+            let connected = async {
+                let device = PxpKnownDevice::new(hint.into(), &info, self.store.clone())
+                    .await
+                    .map_err(|e| {
+                        HybridError::Transport(format!("preparing linked connection: {e}"))
+                    })?;
+                let tunnel = pxp::connect(device, StatusSink(status.clone()));
+                wait_connected(tunnel, LINKED_TIMEOUT, cancel).await
+            };
+            let result = tokio::select! {
+                _ = cancel.cancelled() => Err(HybridError::Cancelled),
+                result = timeout(LINKED_TIMEOUT, connected) => result.unwrap_or(Err(HybridError::Timeout)),
+            };
+            match result {
                 Ok(tunnel) => return Ok(Some((tunnel, id))),
                 Err(HybridError::Cancelled) => return Err(HybridError::Cancelled),
                 Err(e) => {
@@ -108,7 +128,7 @@ impl PxpTransport {
 
         let payload = device.qr_code.to_string();
         debug!(len = payload.len(), "QR code generated");
-        let _ = status.send(Status::ShowQr { payload });
+        let _ = status.send(Status::ShowQr { payload, hint });
 
         let tunnel = pxp::connect(device, StatusSink(status.clone()));
         wait_connected(tunnel, QR_TIMEOUT, cancel).await
@@ -124,12 +144,17 @@ impl HybridTransport for PxpTransport {
         status: watch::Sender<Status>,
         cancel: CancellationToken,
     ) -> Result<Vec<u8>, HybridError> {
-        let result = self.run(frame, hint, &status, &cancel).await;
-        let _ = status.send(match &result {
-            Ok(_) => Status::Done,
-            Err(HybridError::Cancelled) => Status::Idle,
-            Err(e) => Status::Failed(e.to_string()),
-        });
+        // Cancellation and a deadline cover every await in the operation, not
+        // only BLE discovery and the response. Dropping run drops its tunnel.
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(HybridError::Cancelled),
+            result = timeout(REQUEST_TIMEOUT, self.run(frame, hint, &status, &cancel)) => {
+                result.unwrap_or(Err(HybridError::Timeout))
+            }
+        };
+        // The daemon publishes the final UI state together with completion of
+        // the matching request. Transport completion is not CTAP success.
         result
     }
 }
@@ -147,7 +172,13 @@ impl PxpTransport {
             return Err(HybridError::Cancelled);
         }
 
-        let (mut tunnel, linked_id) = match self.connect_linked(hint, status, cancel).await? {
+        let linked = timeout(
+            LINKED_TOTAL_TIMEOUT,
+            self.connect_linked(hint, status, cancel),
+        )
+        .await
+        .unwrap_or(Ok(None))?;
+        let (mut tunnel, linked_id) = match linked {
             Some((tunnel, id)) => (tunnel, Some(id)),
             None => (self.connect_qr(hint, status, cancel).await?, None),
         };
@@ -177,24 +208,37 @@ impl PxpTransport {
             }
         };
 
-        if reply.is_empty() {
-            return Err(HybridError::Transport(
-                "empty CTAP response from the phone".into(),
-            ));
-        }
+        validate_reply(&reply)?;
         debug!(
             status = reply[0],
             len = reply.len(),
             "reply received from the phone"
         );
 
-        // Graceful shutdown so the phone shows success rather than an error.
-        tunnel.close().await;
-        if let Some(id) = linked_id {
-            self.store.touch(&id);
+        // Best-effort graceful shutdown must never withhold a valid CTAP
+        // response because a peer stops reading its tunnel.
+        let _ = timeout(SHUTDOWN_TIMEOUT, tunnel.close()).await;
+        if reply[0] == crate::ctap2::status::OK {
+            if let Some(id) = linked_id {
+                self.store.touch(&id);
+            }
         }
         Ok(reply)
     }
+}
+
+fn validate_reply(reply: &[u8]) -> Result<(), HybridError> {
+    if reply.is_empty() {
+        return Err(HybridError::Transport(
+            "empty CTAP response from the phone".into(),
+        ));
+    }
+    if reply.len() > crate::ctaphid::MAX_PAYLOAD_LEN {
+        return Err(HybridError::Transport(
+            "oversized CTAP response from the phone".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Wait for the tunnel to be connected and authenticated, with a deadline and
@@ -251,5 +295,21 @@ impl From<Hint> for QrCodeOperationHint {
             Hint::MakeCredential => QrCodeOperationHint::MakeCredential,
             Hint::GetAssertion => QrCodeOperationHint::GetAssertionRequest,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_limits_are_enforced_before_hid_fragmentation() {
+        assert!(validate_reply(&[]).is_err());
+        assert!(
+            validate_reply(&[0x27]).is_ok(),
+            "preserve CTAP errors for the browser"
+        );
+        assert!(validate_reply(&vec![0; crate::ctaphid::MAX_PAYLOAD_LEN]).is_ok());
+        assert!(validate_reply(&vec![0; crate::ctaphid::MAX_PAYLOAD_LEN + 1]).is_err());
     }
 }

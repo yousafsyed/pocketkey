@@ -1,104 +1,78 @@
-//! Debug-level description of CTAP2 responses coming back from the phone.
-//! Logs structure only (keys, lengths, flags, transports), never signatures,
-//! credential ids or user data.
+//! Allowlisted, typed CTAP diagnostics. No level (including TRACE) logs raw
+//! CBOR, dynamic map keys, strings, byte values or decoder error text.
+//!
+//! Responses deliberately use operation-independent metadata only: e.g. fields
+//! 5/6 are counts/flags for getAssertion but can contain secrets for
+//! makeCredential. They must never be formatted as generic `Value`s.
 
 use ciborium::Value;
 
-/// Small integer value of a CBOR key, or -1 for anything else.
-fn key_index(k: &Value) -> i64 {
-    match k {
-        Value::Integer(i) => i64::try_from(*i).unwrap_or(-1),
-        _ => -1,
-    }
+use super::canonical;
+
+fn field(map: &Value, key: i64) -> Option<&Value> {
+    map.as_map()?
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(key.into()))
+        .map(|(_, v)| v)
 }
 
-/// Log the shape of a makeCredential request map at debug level, and the raw
-/// frame at trace level (trace includes clientDataHash and user fields; use
-/// only while debugging interop).
+fn array_len(value: Option<&Value>) -> Option<usize> {
+    value.and_then(Value::as_array).map(Vec::len)
+}
+
+fn map_len(value: Option<&Value>) -> Option<usize> {
+    value.and_then(Value::as_map).map(Vec::len)
+}
+
+fn option(map: Option<&Value>, name: &str) -> Option<bool> {
+    map?.as_map()?
+        .iter()
+        .find(|(key, _)| key.as_text() == Some(name))?
+        .1
+        .as_bool()
+}
+
 pub fn log_make_credential_request(cbor: &[u8]) {
-    tracing::trace!(request_hex = %hex_of(cbor), "makeCredential request (raw)");
+    log_request(cbor, true);
+}
+
+/// Retains the original public API, but never dumps a frame, even at TRACE.
+pub fn trace_get_assertion_request(cbor: &[u8]) {
+    log_request(cbor, false);
+}
+
+fn log_request(cbor: &[u8], make_credential: bool) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
-    let Ok(Value::Map(entries)) = ciborium::from_reader::<Value, _>(cbor) else {
-        tracing::debug!("makeCredential request did not decode as a map");
+    let Some(map) = canonical::decode_map(cbor) else {
+        tracing::debug!(len = cbor.len(), "request is not a valid CTAP map");
         return;
     };
-    let field = |key: i64| {
-        entries
-            .iter()
-            .find(|(k, _)| *k == Value::Integer(key.into()))
-            .map(|(_, v)| v)
-    };
-    let map_keys = |v: Option<&Value>| match v {
-        Some(Value::Map(f)) => f
-            .iter()
-            .map(|(k, v)| format!("{}:{}", key_name(k), type_name(v)))
-            .collect::<Vec<_>>(),
-        Some(other) => vec![type_name(other)],
-        None => vec![],
-    };
-    let algs: Vec<String> = match field(4) {
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|p| match p {
-                Value::Map(f) => f
-                    .iter()
-                    .map(|(k, v)| format!("{}={v:?}", key_name(k)))
-                    .collect::<Vec<_>>()
-                    .join(","),
-                other => format!("{other:?}"),
-            })
-            .collect(),
-        _ => vec![],
+    let (hash, list, extensions, options, pin) = if make_credential {
+        (1, 5, 6, 7, 8)
+    } else {
+        (2, 3, 4, 5, 6)
     };
     tracing::debug!(
-        keys = ?entries.iter().map(|(k, _)| key_name(k)).collect::<Vec<_>>(),
-        client_data_hash_len = field(1).and_then(|v| v.as_bytes()).map(|b| b.len()),
-        rp = ?map_keys(field(2)),
-        user = ?map_keys(field(3)),
-        ?algs,
-        exclude_list_len = field(5).and_then(|v| v.as_array()).map(|a| a.len()),
-        extensions = ?map_keys(field(6)),
-        options = ?field(7),
-        has_pin_uv_auth = field(8).is_some(),
-        pin_protocol = ?field(9),
-        enterprise_attestation = ?field(10),
-        attestation_formats = ?field(11),
-        "makeCredential request to forward"
+        make_credential,
+        len = cbor.len(),
+        fields = map_len(Some(&map)),
+        client_data_hash_len = field(&map, hash).and_then(|v| v.as_bytes()).map(Vec::len),
+        credential_list_len = array_len(field(&map, list)),
+        extension_count = map_len(field(&map, extensions)),
+        option_count = map_len(field(&map, options)),
+        up = option(field(&map, options), "up"),
+        uv = option(field(&map, options), "uv"),
+        rk = option(field(&map, options), "rk"),
+        has_pin_uv_auth = field(&map, pin).is_some(),
+        "CTAP request metadata"
     );
 }
 
-/// Trace-level hex dump of a getAssertion request.
-pub fn trace_get_assertion_request(cbor: &[u8]) {
-    tracing::trace!(request_hex = %hex_of(cbor), "getAssertion request (raw)");
-}
-
-fn hex_of(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn key_name(k: &Value) -> String {
-    match k {
-        Value::Integer(i) => format!("{}", i128::from(*i)),
-        Value::Text(t) => t.clone(),
-        other => format!("{other:?}"),
-    }
-}
-
-fn type_name(v: &Value) -> String {
-    match v {
-        Value::Integer(i) => format!("int({})", i128::from(*i)),
-        Value::Bytes(b) => format!("bytes[{}]", b.len()),
-        Value::Text(t) => format!("text[{}]", t.len()),
-        Value::Bool(b) => format!("{b}"),
-        Value::Array(a) => format!("array[{}]", a.len()),
-        Value::Map(m) => format!("map[{}]", m.len()),
-        other => format!("{other:?}"),
-    }
-}
-
-/// Log the shape of a getAssertion/makeCredential response (`status ++ cbor`).
+/// Log only operation-independent metadata for `status ++ cbor`.
+/// In particular, do not interpret or log response fields 5/6 without knowing
+/// the operation: these may be largeBlobKey and unsigned extension outputs.
 pub fn log_response(frame: &[u8]) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
@@ -106,76 +80,155 @@ pub fn log_response(frame: &[u8]) {
     let Some((&status, cbor)) = frame.split_first() else {
         return;
     };
-    if status != 0 || cbor.is_empty() {
-        tracing::debug!(status, len = frame.len(), "phone response");
-        return;
-    }
-    let value: Value = match ciborium::from_reader(cbor) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(error = %e, len = cbor.len(), "phone response CBOR did not decode");
-            return;
-        }
-    };
-    let Value::Map(entries) = &value else {
-        tracing::debug!("phone response is not a CBOR map");
-        return;
-    };
-    let keys: Vec<String> = entries.iter().map(|(k, _)| format!("{k:?}")).collect();
-    let field = |key: i64| {
-        entries
-            .iter()
-            .find(|(k, _)| *k == Value::Integer(key.into()))
-            .map(|(_, v)| v)
-    };
-    let auth_data = field(2).and_then(|v| v.as_bytes()).map(|b| {
-        let flags = b.get(32).copied().unwrap_or(0);
-        format!(
-            "len={} flags=0x{flags:02x}(up={} uv={} be={} bs={} at={} ed={}) counter={}",
-            b.len(),
-            flags & 0x01 != 0,
-            flags & 0x04 != 0,
-            flags & 0x08 != 0,
-            flags & 0x10 != 0,
-            flags & 0x40 != 0,
-            flags & 0x80 != 0,
-            b.get(33..37)
-                .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
-                .unwrap_or(0)
-        )
-    });
-    let credential = field(1).map(|v| match v {
-        Value::Map(f) => f
-            .iter()
-            .map(|(k, v)| match (k.as_text(), v) {
-                (Some("id"), Value::Bytes(b)) => format!("id[{}]", b.len()),
-                (Some(k), v) => format!("{k}={v:?}"),
-                (None, _) => "?".into(),
-            })
-            .collect::<Vec<_>>()
-            .join(","),
-        other => format!("{other:?}"),
-    });
-    let user_keys = field(4).map(|v| match v {
-        Value::Map(f) => f
-            .iter()
-            .filter_map(|(k, _)| k.as_text().map(str::to_string))
-            .collect::<Vec<_>>(),
-        _ => vec!["(not a map)".into()],
-    });
+    let map = canonical::decode_map(cbor);
     tracing::debug!(
-        ?keys,
-        credential = credential.as_deref().unwrap_or("-"),
-        auth_data = auth_data.as_deref().unwrap_or("-"),
-        signature_len = field(3).and_then(|v| v.as_bytes()).map(|b| b.len()),
-        ?user_keys,
-        number_of_credentials = ?field(5),
-        user_selected = ?field(6),
-        extra = ?entries
-            .iter()
-            .filter(|(k, _)| !(1..=6).contains(&key_index(k)))
-            .map(|(k, _)| format!("{k:?}"))
-            .collect::<Vec<_>>(),
-        "phone response"
+        status,
+        len = frame.len(),
+        valid_map = map.is_some(),
+        fields = map_len(map.as_ref()),
+        "phone response metadata"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const CAPTURE_CHILD: &str = "ctap2::describe::tests::trace_capture_isolated_child";
+    const CAPTURE_COMPLETE: &str = "CTAP trace capture assertions completed";
+
+    #[test]
+    fn trace_capture_never_contains_request_or_response_secrets() {
+        // tracing's callsite interest cache is process-global. With only one
+        // registered subscriber, tracing-core can initialize a new callsite's
+        // interest from the registering thread's default dispatcher. Other
+        // tests invoking these loggers without our thread-local subscriber can
+        // therefore cache `never` while a scoped capture is running.
+        // Run only the capture body in a fresh process, not under a mutex that
+        // unrelated tests do not acquire. No production logging changes needed.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                CAPTURE_CHILD,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .expect("start isolated CTAP trace capture test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated CTAP trace capture failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        // A mistyped --exact filter runs zero tests and still exits successfully.
+        // Require a marker emitted only after every capture assertion passed.
+        assert!(
+            stdout.contains(CAPTURE_COMPLETE),
+            "capture child did not complete:\n{stdout}\n{stderr}"
+        );
+    }
+
+    #[test]
+    #[ignore = "run in its own process by trace_capture_never_contains_request_or_response_secrets"]
+    fn trace_capture_isolated_child() {
+        let capture = Capture(Arc::new(Mutex::new(Vec::new())));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        // Keep the repeated nested fixture below MAX_MSG_SIZE so it exercises
+        // the metadata path (especially options), not only decode rejection.
+        let secret = "SECRET_7c8125";
+        let bytes = secret.as_bytes().to_vec();
+        let opaque = Value::Map(vec![
+            (Value::Text(secret.into()), Value::Text(secret.into())),
+            (Value::Text("id".into()), Value::Bytes(bytes.clone())),
+            (Value::Text("type".into()), Value::Text(secret.into())),
+            (Value::Text("up".into()), Value::Text(secret.into())),
+            (Value::Text("uv".into()), Value::Bytes(bytes.clone())),
+            (
+                Value::Text("transports".into()),
+                Value::Array(vec![Value::Text(secret.into())]),
+            ),
+        ]);
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("capture child owns its process-global subscriber");
+        // Exercise each field with unexpected types, including options,
+        // algorithms, unknown keys and the operation-dependent fields 5/6.
+        for value in [
+            opaque,
+            Value::Bytes(bytes.clone()),
+            Value::Text(secret.into()),
+        ] {
+            let mut entries: Vec<_> = (1..=12)
+                .map(|key| (Value::Integer(key.into()), value.clone()))
+                .collect();
+            entries.push((Value::Text(secret.into()), value));
+            let cbor = canonical::encode_canonical(Value::Map(entries));
+            assert!(
+                canonical::decode_map(&cbor).is_some(),
+                "capture fixture must be a valid bounded map"
+            );
+            log_make_credential_request(&cbor);
+            trace_get_assertion_request(&cbor);
+            let mut frame = vec![0];
+            frame.extend_from_slice(&cbor);
+            log_response(&frame);
+        }
+        // Decoding failures must not leak error messages with input text.
+        log_response(&[0, 0xff]);
+        log_make_credential_request(&[0xff]);
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            output.matches("CTAP request metadata").count(),
+            6,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("phone response metadata").count(),
+            4,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("make_credential=true").count(),
+            3,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("make_credential=false").count(),
+            3,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("request is not a valid CTAP map").count(),
+            1,
+            "{output}"
+        );
+        assert!(!output.contains(secret), "{output}");
+        assert!(!output.contains(&hex::encode(&bytes)), "{output}");
+        assert!(!output.contains(&format!("{bytes:?}")), "{output}");
+        assert!(!output.contains("request_hex"), "{output}");
+        println!("{CAPTURE_COMPLETE}");
+    }
 }
