@@ -1,6 +1,6 @@
 [package]
 name = "pocketkey"
-version = "0.1.2"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Virtual FIDO2 USB security key that proxies CTAP2 to a phone over the WebAuthn hybrid transport"
