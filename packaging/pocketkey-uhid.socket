@@ -1,0 +1,13 @@
+[Unit]
+Description=pocketkey virtual FIDO device helper socket
+Documentation=https://github.com/yousafsyed/pocketkey
+
+[Socket]
+ListenStream=/run/pocketkey/uhid.sock
+# Any local user may ask for a FIDO device; the helper enforces one per uid.
+SocketMode=0666
+DirectoryMode=0755
+Accept=no
+
+[Install]
+WantedBy=sockets.target

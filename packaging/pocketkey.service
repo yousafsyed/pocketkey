@@ -6,6 +6,8 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
+# The device descriptor comes from the system helper (pocketkey-uhid.socket);
+# this user service never needs access to /dev/uhid.
 ExecStart=/usr/bin/pocketkey
 Restart=on-failure
 RestartSec=2

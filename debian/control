@@ -13,7 +13,7 @@ Package: pocketkey
 Architecture: amd64
 # The window toolkit loads its graphics/display libraries at runtime (dlopen),
 # so dpkg-shlibdeps cannot see them; list them explicitly.
-Depends: ${shlibs:Depends}, ${misc:Depends}, bluez, udev,
+Depends: ${shlibs:Depends}, ${misc:Depends}, bluez, udev, systemd, acl,
  libxkbcommon0, libegl1, libgl1, libwayland-client0, libwayland-egl1,
  libx11-6, libxcursor1, libxi6, libxrandr2
 Recommends: fido2-tools
@@ -23,3 +23,6 @@ Description: virtual FIDO2 security key backed by your phone (WebAuthn hybrid)
  WebAuthn hybrid transport (QR code, Bluetooth LE proximity, encrypted
  tunnel). It lets browsers without hybrid support on Linux, such as
  Firefox, use passkeys stored on an Android phone or iPhone.
+ .
+ A small socket-activated root helper creates the virtual device, so the
+ user session never needs access to /dev/uhid.

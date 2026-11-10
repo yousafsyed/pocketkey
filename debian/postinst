@@ -1,8 +1,15 @@
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
+    # Versions before 0.2 granted the whole desktop session access to
+    # /dev/uhid through a udev rule. The privileged helper replaces that.
+    rm -f /etc/udev/rules.d/60-pocketkey.rules /etc/udev/rules.d/99-pocketkey.rules
     udevadm control --reload || true
     modprobe uhid || true
-    udevadm trigger --action=add /sys/class/misc/uhid || true
+    # Drop any ACL the old rule left on the node; it is recreated per boot
+    # otherwise and the helper does not need it.
+    if command -v setfacl >/dev/null 2>&1 && [ -e /dev/uhid ]; then
+        setfacl -b /dev/uhid || true
+    fi
 fi
 #DEBHELPER#
