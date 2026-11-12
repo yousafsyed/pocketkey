@@ -28,7 +28,9 @@ the phone first). Watch logs in a second terminal:
 | # | Step | Expect |
 |---|------|--------|
 | 2.1 | `fido2-token -I /dev/hidrawN` | versions FIDO_2_0, FIDO_2_1; options rk/up/uv true, plat false; **no** clientPin; maxmsgsiz 2048; aaguid `95e354b394094696bd03b87ed806ef7a` |
-| 2.2 | Firefox → <https://webauthn.io> → Authenticate → "security key" | Firefox shows its "insert/touch your security key" prompt (not an instant error); pocketkey window opens |
+| 2.2 | Firefox → <https://webauthn.io> → Authenticate → "security key" | Firefox shows its "insert/touch your security key" prompt (not an instant error); pocketkey window opens asking "Use your phone for this sign-in?"; QR appears only after the click |
+| 2.3 | Chrome → <https://webauthn.io> → Register | Chrome's own "Use your phone or tablet" QR dialog appears; pocketkey shows only its small "Use your phone…?" prompt, **not** a second QR. Scanning Chrome's QR completes the request and pocketkey's prompt closes (Chrome sends CANCEL) |
+| 2.4 | `POCKETKEY_IMMEDIATE=1` in the user unit, restart, repeat 2.2 | QR appears immediately without the click |
 
 ## M3: getAssertion via QR
 
@@ -48,6 +50,13 @@ phone closes the tunnel without replying.
 Re-verified 2026-11-10 on webauthn.io (registration and sign-in, both
 phones) with the device created by the privileged `pocketkey-uhid-helper`
 instead of a session-accessible `/dev/uhid`, installed from the `.deb`.
+
+Known RP-side refusal (2026-11-12): **icloud.com** completes the phone round
+trip (`cable.auth.com`, `status=0`) and then rejects the result with "Your
+browser needs to be updated to support signing in with a passkey". Apple's
+sites only accept platform/hybrid authenticators for Apple Account passkeys;
+a USB security key, which is what the browser reports pocketkey as, is
+refused by policy. Not fixable in pocketkey; documented in README Limitations.
 
 | # | Step | Expect |
 |---|------|--------|

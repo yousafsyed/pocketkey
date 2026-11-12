@@ -312,24 +312,43 @@ fn handle_event(
                         send_all(device, &hid.respond(id, &[ctap2::status::CTAP1_ERR_OTHER]))?;
                         return Ok(());
                     }
-                    info!(?hint, "forwarding request to the phone");
-                    let _ = status_tx.send(Status::Starting);
+                    // Browsers with a native hybrid flow (Chrome) dispatch a
+                    // request to every transport at once. A physical key waits
+                    // for a touch before acting; mirror that: ask the user to
+                    // pick this key before starting the phone flow, so Chrome's
+                    // own QR is not shadowed by ours. Firefox has no chooser,
+                    // so for it this is the one explicit consent click.
+                    let gate = immediate_mode();
+                    info!(?hint, gated = !gate, "request for the phone");
                     let _ = request_tx.send(Some(id));
                     let cancel = CancellationToken::new();
                     // Give each task its own progress channel. The event loop
                     // alone publishes UI state, so a cancelled task cannot
                     // overwrite a later request's status.
-                    let (progress_tx, progress_rx) = watch::channel(Status::Starting);
+                    let initial = if gate {
+                        Status::Starting
+                    } else {
+                        Status::Selecting
+                    };
+                    let _ = status_tx.send(initial.clone());
+                    let (progress_tx, progress_rx) = watch::channel(initial);
+                    let (selected, selection_rx) = oneshot::channel();
                     let task = tokio::spawn({
                         let transport = Arc::clone(transport);
                         let cancel = cancel.clone();
-                        async move { transport.ctap(frame, hint, progress_tx, cancel).await }
+                        async move {
+                            if !gate {
+                                wait_for_selection(selection_rx, cancel.clone()).await?;
+                                let _ = progress_tx.send(Status::Starting);
+                            }
+                            transport.ctap(frame, hint, progress_tx, cancel).await
+                        }
                     });
                     *active = Some(Active {
                         id,
                         task,
                         cancel,
-                        selection: None,
+                        selection: if gate { None } else { Some(selected) },
                         progress: Some(progress_rx),
                     });
                 }
@@ -372,6 +391,13 @@ fn handle_event(
         Event::RejectedCbor { cid } => ctap.reject_channel(cid),
     }
     Ok(())
+}
+
+/// `POCKETKEY_IMMEDIATE=1` skips the "use this key?" step and starts the phone
+/// flow as soon as a request arrives, as before. Only sensible for Firefox-only
+/// setups: with Chrome it makes our QR compete with Chrome's native one.
+fn immediate_mode() -> bool {
+    std::env::var_os("POCKETKEY_IMMEDIATE").is_some_and(|v| v == "1" || v == "true")
 }
 
 async fn wait_for_selection(
@@ -480,6 +506,54 @@ mod tests {
         assert_eq!(completion_status(&[0x2d]), Status::Idle);
         assert!(matches!(completion_status(&[0x27]), Status::Failed(_)));
         assert!(matches!(completion_status(&[]), Status::Failed(_)));
+    }
+
+    #[test]
+    fn immediate_mode_is_opt_in_only() {
+        // Default: gate the phone flow behind an explicit click, so Chrome's
+        // own hybrid QR is never shadowed by ours.
+        std::env::remove_var("POCKETKEY_IMMEDIATE");
+        assert!(!immediate_mode());
+        std::env::set_var("POCKETKEY_IMMEDIATE", "0");
+        assert!(!immediate_mode());
+        std::env::set_var("POCKETKEY_IMMEDIATE", "1");
+        assert!(immediate_mode());
+        std::env::set_var("POCKETKEY_IMMEDIATE", "true");
+        assert!(immediate_mode());
+        std::env::remove_var("POCKETKEY_IMMEDIATE");
+    }
+
+    #[tokio::test]
+    async fn gated_request_does_not_start_the_phone_flow_until_selected() {
+        // Models the Forward path with the gate on: the transport future must
+        // not be polled before the user selects; cancel (Chrome picking its
+        // own QR) must end it with Cancelled and never reach the transport.
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let run = |selected: oneshot::Receiver<()>, cancel: CancellationToken| {
+            let started = started.clone();
+            async move {
+                wait_for_selection(selected, cancel.clone()).await?;
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<Vec<u8>, HybridError>(vec![0])
+            }
+        };
+
+        let (tx, rx) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run(rx, cancel.clone()));
+        tokio::task::yield_now().await;
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        cancel.cancel();
+        assert_eq!(task.await.unwrap(), Err(HybridError::Cancelled));
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        drop(tx);
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(run(rx, CancellationToken::new()));
+        tokio::task::yield_now().await;
+        tx.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), Ok(vec![0]));
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test(start_paused = true)]

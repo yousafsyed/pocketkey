@@ -339,8 +339,11 @@ impl App {
                         Status::Selecting => {
                             draw_phone(ui, &palette, false);
                             (
-                                Some("Choose this security key?".to_string()),
-                                "Use your phone as the security key for this request.".to_string(),
+                                Some("Use your phone for this sign-in?".to_string()),
+                                "pocketkey will show a QR code for your phone.\n\
+                                 If your browser already offers its own \"use a phone\" option \
+                                 (Chrome does), that one works on more sites; just close this."
+                                    .to_string(),
                                 true,
                             )
                         }

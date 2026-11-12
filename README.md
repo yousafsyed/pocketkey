@@ -13,7 +13,11 @@ The point: Firefox on Linux has no hybrid support
 so passkeys stored in Google Password Manager on an Android phone (or in
 iCloud Keychain) cannot be used from Firefox. With pocketkey, Firefox's
 "use your security key" path works with them. Anything else that talks to USB
-security keys (Chrome, `libfido2`, `ssh-sk`) works too.
+security keys (`libfido2`, `ssh-sk`) works too.
+
+**Chrome users do not need pocketkey.** Chrome on Linux has native hybrid
+support ("Use your phone or tablet"), which reports the correct `hybrid`
+transport and works on more sites. pocketkey is for browsers that lack it.
 
 **Mental model:** wrap the transport Firefox lacks (hybrid) inside the
 transport Firefox already supports (CTAPHID over USB HID).
@@ -64,8 +68,8 @@ Firefox ──hidraw──▶ /dev/uhid ──▶ pocketkey ──BLE + wss tunn
   [Mozilla's instructions](https://support.mozilla.org/kb/install-firefox-linux#w_install-firefox-deb-package-for-debian-based-distributions)
   for switching.
 - An Android phone with passkeys in Google Password Manager, or an iPhone
-  with iCloud Keychain. Both are tested with Firefox and Chrome for
-  registration and sign-in.
+  with iCloud Keychain. Both are tested for registration and sign-in on
+  webauthn.io (see Limitations for Apple's own sites).
 
 ## Install
 
@@ -111,7 +115,10 @@ the snap cannot see the virtual key (see Requirements).
 ## Use
 
 In Firefox, on a site that offers passkeys, choose "security key" / "use a
-different device" if asked. The pocketkey window appears:
+different device" if asked. The pocketkey window appears and asks **"Use your
+phone for this sign-in?"**; click the button to continue. (A physical key
+waits for a touch; this click is pocketkey's equivalent, and it stops
+pocketkey's QR from competing with a browser's own "use a phone" dialog.)
 
 - **First time:** scan the QR code with the phone's camera, approve on the
   phone. The phone is now linked.
@@ -121,9 +128,11 @@ different device" if asked. The pocketkey window appears:
   retired phone linking in 2024 in favour of passkey sync), so expect a QR
   code every time with such phones.
 
-Cancel from the window, from Firefox's dialog, or on the phone. If the browser
-asks you to select an authenticator, click **Use this phone-backed key** in the
-pocketkey window; selection no longer happens automatically.
+Cancel from the window, from Firefox's dialog, or on the phone.
+
+If you only ever use Firefox and want the QR to appear without the extra
+click, set `POCKETKEY_IMMEDIATE=1` in the service environment
+(`systemctl --user edit pocketkey`). Leave it off if you also use Chrome.
 
 ## Security notes
 
@@ -182,6 +191,17 @@ pocketkey window; selection no longer happens automatically.
   received by the proxy blocks credential operations until channel
   reinitialization. This compatibility behavior is tested against Firefox and
   Chromium; other clients may behave differently.
+- **The browser sees a USB security key, not a phone.** Transport and
+  attachment in the WebAuthn result are set by the browser from the physical
+  path (`usb`, `cross-platform`); nothing in the CTAP response can change
+  that. Most sites do not care. **Apple's own sites (icloud.com,
+  appleid.apple.com) do:** they only accept platform/hybrid authenticators
+  for Apple Account passkeys and show *"Your browser needs to be updated to
+  support signing in with a passkey"* when a security key answers. That is
+  Apple's relying-party policy, not a pocketkey failure. On those pages use
+  the **"Sign in with iPhone"** button (Apple's own QR flow), or Chrome's
+  native hybrid option. iCloud Keychain passkeys work through pocketkey on
+  other sites.
 - No U2F/CTAP1, no PIN, no credential management, no NFC. `getNextAssertion`
   is only served for the local pre-flight answer above; phones return a
   single assertion.
