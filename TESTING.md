@@ -28,9 +28,9 @@ the phone first). Watch logs in a second terminal:
 | # | Step | Expect |
 |---|------|--------|
 | 2.1 | `fido2-token -I /dev/hidrawN` | versions FIDO_2_0, FIDO_2_1; options rk/up/uv true, plat false; **no** clientPin; maxmsgsiz 2048; aaguid `95e354b394094696bd03b87ed806ef7a` |
-| 2.2 | Firefox → <https://webauthn.io> → Authenticate → "security key" | Firefox shows its "insert/touch your security key" prompt (not an instant error); pocketkey window opens asking "Use your phone for this sign-in?"; QR appears only after the click |
-| 2.3 | Chrome → <https://webauthn.io> → Register | Chrome's own "Use your phone or tablet" QR dialog appears; pocketkey shows only its small "Use your phone…?" prompt, **not** a second QR. Scanning Chrome's QR completes the request and pocketkey's prompt closes (Chrome sends CANCEL) |
-| 2.4 | `POCKETKEY_IMMEDIATE=1` in the user unit, restart, repeat 2.2 | QR appears immediately without the click |
+| 2.2 | Firefox → <https://webauthn.io> → Authenticate → "security key" | Firefox shows its "insert/touch your security key" prompt (not an instant error); pocketkey window opens straight to the QR, no extra click |
+| 2.3 | Chrome → <https://webauthn.io> → Register | Chrome's own "Use your phone or tablet" QR dialog and pocketkey's QR both appear. Scanning Chrome's QR completes the request and pocketkey's window closes by itself (Chrome sends CANCEL), with no error shown |
+| 2.4 | `POCKETKEY_ASK=1` in the user unit, restart, repeat 2.2 | pocketkey first asks "Use your phone for this sign-in?"; QR appears after the click |
 
 ## M3: getAssertion via QR
 

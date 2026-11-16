@@ -115,10 +115,7 @@ the snap cannot see the virtual key (see Requirements).
 ## Use
 
 In Firefox, on a site that offers passkeys, choose "security key" / "use a
-different device" if asked. The pocketkey window appears and asks **"Use your
-phone for this sign-in?"**; click the button to continue. (A physical key
-waits for a touch; this click is pocketkey's equivalent, and it stops
-pocketkey's QR from competing with a browser's own "use a phone" dialog.)
+different device" if asked. The pocketkey window appears:
 
 - **First time:** scan the QR code with the phone's camera, approve on the
   phone. The phone is now linked.
@@ -130,9 +127,13 @@ pocketkey's QR from competing with a browser's own "use a phone" dialog.)
 
 Cancel from the window, from Firefox's dialog, or on the phone.
 
-If you only ever use Firefox and want the QR to appear without the extra
-click, set `POCKETKEY_IMMEDIATE=1` in the service environment
-(`systemctl --user edit pocketkey`). Leave it off if you also use Chrome.
+In Chrome you will see two QR codes: Chrome's own "Use your phone or tablet"
+dialog and pocketkey's. Scan **Chrome's**; it reports the correct `hybrid`
+transport and works on more sites. pocketkey's window closes on its own when
+Chrome cancels the USB request. If that bothers you, `POCKETKEY_ASK=1` in the
+service environment (`systemctl --user edit pocketkey`) makes pocketkey ask
+"Use your phone for this sign-in?" before showing its QR; it adds a click to
+every Firefox sign-in, so it is off by default.
 
 ## Security notes
 

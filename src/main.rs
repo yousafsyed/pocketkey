@@ -312,23 +312,23 @@ fn handle_event(
                         send_all(device, &hid.respond(id, &[ctap2::status::CTAP1_ERR_OTHER]))?;
                         return Ok(());
                     }
-                    // Browsers with a native hybrid flow (Chrome) dispatch a
-                    // request to every transport at once. A physical key waits
-                    // for a touch before acting; mirror that: ask the user to
-                    // pick this key before starting the phone flow, so Chrome's
-                    // own QR is not shadowed by ours. Firefox has no chooser,
-                    // so for it this is the one explicit consent click.
-                    let gate = immediate_mode();
-                    info!(?hint, gated = !gate, "request for the phone");
+                    // Start the phone flow straight away: pocketkey exists for
+                    // browsers with no hybrid flow of their own (Firefox), where
+                    // a confirmation click would be pure friction. Chrome, which
+                    // has its own QR, dispatches to every transport at once and
+                    // sends CANCEL the moment the user picks its own dialog; that
+                    // closes ours silently. POCKETKEY_ASK=1 opts into asking first.
+                    let ask = ask_before_phone_flow();
+                    info!(?hint, ask, "request for the phone");
                     let _ = request_tx.send(Some(id));
                     let cancel = CancellationToken::new();
                     // Give each task its own progress channel. The event loop
                     // alone publishes UI state, so a cancelled task cannot
                     // overwrite a later request's status.
-                    let initial = if gate {
-                        Status::Starting
-                    } else {
+                    let initial = if ask {
                         Status::Selecting
+                    } else {
+                        Status::Starting
                     };
                     let _ = status_tx.send(initial.clone());
                     let (progress_tx, progress_rx) = watch::channel(initial);
@@ -337,7 +337,7 @@ fn handle_event(
                         let transport = Arc::clone(transport);
                         let cancel = cancel.clone();
                         async move {
-                            if !gate {
+                            if ask {
                                 wait_for_selection(selection_rx, cancel.clone()).await?;
                                 let _ = progress_tx.send(Status::Starting);
                             }
@@ -348,7 +348,7 @@ fn handle_event(
                         id,
                         task,
                         cancel,
-                        selection: if gate { None } else { Some(selected) },
+                        selection: if ask { Some(selected) } else { None },
                         progress: Some(progress_rx),
                     });
                 }
@@ -393,11 +393,12 @@ fn handle_event(
     Ok(())
 }
 
-/// `POCKETKEY_IMMEDIATE=1` skips the "use this key?" step and starts the phone
-/// flow as soon as a request arrives, as before. Only sensible for Firefox-only
-/// setups: with Chrome it makes our QR compete with Chrome's native one.
-fn immediate_mode() -> bool {
-    std::env::var_os("POCKETKEY_IMMEDIATE").is_some_and(|v| v == "1" || v == "true")
+/// `POCKETKEY_ASK=1` shows a "use your phone for this sign-in?" step before the
+/// QR. Off by default: Firefox has no chooser of its own, so the click would be
+/// pure friction. Useful only if you also use pocketkey from Chrome and would
+/// rather not see our QR next to Chrome's native one.
+fn ask_before_phone_flow() -> bool {
+    std::env::var_os("POCKETKEY_ASK").is_some_and(|v| v == "1" || v == "true")
 }
 
 async fn wait_for_selection(
@@ -509,25 +510,25 @@ mod tests {
     }
 
     #[test]
-    fn immediate_mode_is_opt_in_only() {
-        // Default: gate the phone flow behind an explicit click, so Chrome's
-        // own hybrid QR is never shadowed by ours.
-        std::env::remove_var("POCKETKEY_IMMEDIATE");
-        assert!(!immediate_mode());
-        std::env::set_var("POCKETKEY_IMMEDIATE", "0");
-        assert!(!immediate_mode());
-        std::env::set_var("POCKETKEY_IMMEDIATE", "1");
-        assert!(immediate_mode());
-        std::env::set_var("POCKETKEY_IMMEDIATE", "true");
-        assert!(immediate_mode());
-        std::env::remove_var("POCKETKEY_IMMEDIATE");
+    fn asking_first_is_opt_in_only() {
+        // Default: start the phone flow immediately. Firefox (the audience)
+        // has no chooser, so a confirmation click there is pure friction.
+        std::env::remove_var("POCKETKEY_ASK");
+        assert!(!ask_before_phone_flow());
+        std::env::set_var("POCKETKEY_ASK", "0");
+        assert!(!ask_before_phone_flow());
+        std::env::set_var("POCKETKEY_ASK", "1");
+        assert!(ask_before_phone_flow());
+        std::env::set_var("POCKETKEY_ASK", "true");
+        assert!(ask_before_phone_flow());
+        std::env::remove_var("POCKETKEY_ASK");
     }
 
     #[tokio::test]
-    async fn gated_request_does_not_start_the_phone_flow_until_selected() {
-        // Models the Forward path with the gate on: the transport future must
-        // not be polled before the user selects; cancel (Chrome picking its
-        // own QR) must end it with Cancelled and never reach the transport.
+    async fn opt_in_ask_does_not_start_the_phone_flow_until_selected() {
+        // Models the Forward path with POCKETKEY_ASK on: the transport future
+        // must not be polled before the user selects; cancel (Chrome picking
+        // its own QR) must end it with Cancelled and never reach the transport.
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let run = |selected: oneshot::Receiver<()>, cancel: CancellationToken| {
             let started = started.clone();
