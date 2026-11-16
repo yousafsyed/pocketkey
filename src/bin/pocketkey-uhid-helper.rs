@@ -2,19 +2,23 @@
 //!
 //! systemd socket-activates this as root on `/run/pocketkey/uhid.sock`. A
 //! connecting user daemon sends one request byte; the helper creates the
-//! virtual FIDO device (fixed report descriptor, fixed VID/PID) and passes the
-//! `/dev/uhid` descriptor back over the socket, then closes its own copy.
+//! virtual FIDO device (fixed report descriptor, fixed VID/PID), keeps the
+//! `/dev/uhid` descriptor, and passes the daemon one end of a seqpacket
+//! socketpair. A relay thread then shuttles `struct uhid_event`s between the
+//! two: everything from the kernel goes to the daemon; from the daemon only
+//! `UHID_INPUT2`, `UHID_GET_REPORT_REPLY` and `UHID_SET_REPORT_REPLY` reach
+//! the kernel, and anything else ends the session.
 //!
-//! The descriptor is a plain `/dev/uhid` fd. The kernel does not tie it to the
-//! device the helper created: its holder can issue `UHID_DESTROY` and then
-//! `UHID_CREATE2` with any report descriptor (neither carries a credential
-//! check), so handing it out is equivalent to granting `/dev/uhid` access. The
-//! socket unit therefore restricts connections to the `pocketkey` group
-//! (`0660 root:pocketkey`); see issue #4.
+//! The daemon therefore never holds a `/dev/uhid` descriptor. It cannot send
+//! `UHID_DESTROY` + `UHID_CREATE2` to turn the device into a keyboard or
+//! anything else (the kernel performs no credential check on those; see
+//! issue #4). When the daemon closes its end the helper closes `/dev/uhid`
+//! and the kernel removes the device.
 //!
-//! Policy: members of the `pocketkey` group may request a device, one device
-//! per uid at a time. The helper does no parsing of structured data, no
-//! networking and no CTAP.
+//! Policy: members of the `pocketkey` group (enforced by the socket unit's
+//! `0660 root:pocketkey`) may request a device, one per uid at a time. The
+//! helper inspects only the 4-byte event type of daemon traffic; it does no
+//! parsing of report contents, no networking and no CTAP.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -26,14 +30,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pocketkey::uhid::helper::{
-    self, REPLY_BUSY, REPLY_DEVICE, REPLY_ERROR, REQUEST_DEVICE, SOCKET_PATH,
+    self, RelayEnd, REPLY_BUSY, REPLY_DEVICE, REPLY_ERROR, REQUEST_CHANNEL, SOCKET_PATH,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const UHID_PATH: &str = "/dev/uhid";
 /// Idle exit so the privileged process is not resident between logins;
-/// systemd restarts it on the next connection.
+/// systemd restarts it on the next connection. Only taken when no device is
+/// alive, since the helper now holds every device's `/dev/uhid` descriptor.
 const IDLE_EXIT: Duration = Duration::from_secs(60);
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound concurrent handling so a flood of connections cannot exhaust the helper.
@@ -70,9 +75,9 @@ fn main() {
     }
 }
 
-/// Devices currently handed out, keyed by uid. A device is released when the
-/// client's socket closes (the daemon exited) so a crashed daemon does not
-/// lock its user out.
+/// Devices currently alive, keyed by uid. A device is released when its
+/// relay ends, i.e. when the daemon closes its channel (exit or crash) or
+/// misbehaves, so a crashed daemon does not lock its user out.
 type Active = Arc<Mutex<HashMap<u32, ()>>>;
 
 fn serve(listener: UnixListener) -> io::Result<()> {
@@ -115,6 +120,9 @@ fn serve(listener: UnixListener) -> io::Result<()> {
     }
 }
 
+/// One thread per client, alive for as long as its device. The request
+/// socket is only used for the handshake; the device's lifetime is tied to
+/// the channel.
 fn handle_client(stream: UnixStream, active: &Active) {
     let _ = stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
@@ -136,8 +144,11 @@ fn handle_client(stream: UnixStream, active: &Active) {
             return;
         }
     };
-    if request != REQUEST_DEVICE {
-        warn!(uid, request, "unknown request code");
+    if request != REQUEST_CHANNEL {
+        warn!(
+            uid,
+            request, "unknown request code (daemon and helper versions must match)"
+        );
         let _ = helper::send_byte(&stream, REPLY_ERROR, None);
         return;
     }
@@ -152,29 +163,65 @@ fn handle_client(stream: UnixStream, active: &Active) {
         map.insert(uid, ());
     }
 
-    let outcome = helper::create_device_for_client(Path::new(UHID_PATH));
-    match outcome {
-        Ok(device) => {
-            if let Err(e) = helper::send_byte(&stream, REPLY_DEVICE, Some(&device)) {
-                warn!(uid, error = %e, "could not pass the device to the client");
-                release(active, uid);
-                return;
-            }
-            // Our copy closes here; the client's descriptor keeps the device alive.
-            drop(device);
-            info!(uid, "virtual FIDO device handed to user daemon");
-            // Hold the per-uid slot until the client's socket closes (its exit),
-            // then let the user request a fresh device.
-            wait_for_close(&stream);
+    let (uhid, helper_end) = match set_up_device(&stream, uid) {
+        Some(pair) => pair,
+        None => {
             release(active, uid);
-            info!(uid, "user daemon disconnected; device slot released");
+            return;
         }
+    };
+    // The handshake is over; the request socket plays no further part.
+    drop(stream);
+    info!(uid, "virtual FIDO device created; relaying for user daemon");
+
+    let end = helper::relay(&uhid, &helper_end);
+    match end {
+        RelayEnd::DaemonClosed => info!(uid, "user daemon disconnected"),
+        RelayEnd::DaemonViolation(ty) => {
+            warn!(
+                uid,
+                event_type = ty,
+                "daemon sent a forbidden uhid event; disconnecting"
+            )
+        }
+        RelayEnd::KernelClosed => warn!(uid, "kernel closed the uhid device"),
+        RelayEnd::Io(kind) => warn!(uid, error = ?kind, "relay failed"),
+    }
+    // Closing /dev/uhid destroys the device.
+    drop(uhid);
+    drop(helper_end);
+    release(active, uid);
+    info!(uid, "device destroyed; slot released");
+}
+
+/// Create the device and hand the daemon its channel end. Returns what the
+/// relay needs, or `None` after telling the client why.
+fn set_up_device(stream: &UnixStream, uid: u32) -> Option<(File, OwnedFd)> {
+    let uhid = match helper::create_device(Path::new(UHID_PATH)) {
+        Ok(file) => file,
         Err(e) => {
             warn!(uid, error = %e, "creating the uhid device failed");
-            let _ = helper::send_byte(&stream, REPLY_ERROR, None);
-            release(active, uid);
+            let _ = helper::send_byte(stream, REPLY_ERROR, None);
+            return None;
         }
+    };
+    let (helper_end, daemon_end) = match helper::channel_pair() {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(uid, error = %e, "creating the event channel failed");
+            let _ = helper::send_byte(stream, REPLY_ERROR, None);
+            return None;
+        }
+    };
+    let daemon_file = File::from(daemon_end);
+    if let Err(e) = helper::send_byte(stream, REPLY_DEVICE, Some(&daemon_file)) {
+        warn!(uid, error = %e, "could not pass the channel to the client");
+        return None;
     }
+    // Our copy of the daemon's end closes here so that the daemon dropping
+    // its descriptor is seen as EOF by the relay.
+    drop(daemon_file);
+    Some((uhid, helper_end))
 }
 
 fn release(active: &Active, uid: u32) {
@@ -182,30 +229,6 @@ fn release(active: &Active, uid: u32) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(&uid);
-}
-
-/// Block until the peer closes. The client sends nothing further, so any
-/// readable event means EOF (or an error), both of which end the session.
-fn wait_for_close(stream: &UnixStream) {
-    let _ = stream.set_read_timeout(None);
-    let mut pollfd = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN | libc::POLLHUP | libc::POLLRDHUP,
-        revents: 0,
-    };
-    loop {
-        // SAFETY: pollfd is a valid single-element array for the call.
-        let rc = unsafe { libc::poll(&mut pollfd, 1, -1) };
-        if rc < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return;
-        }
-        if rc > 0 {
-            return;
-        }
-    }
 }
 
 /// systemd passes activated sockets starting at fd 3 with LISTEN_FDS set.

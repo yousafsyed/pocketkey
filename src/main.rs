@@ -158,7 +158,8 @@ async fn run(
     .await;
     let _ = status_tx.send(Status::Idle);
     let _ = request_tx.send(None);
-    // Always tear the device down so clients do not see a stale hidraw node.
+    // Always close the channel so the helper destroys the device and clients
+    // do not see a stale hidraw node.
     if let Err(e) = device.destroy() {
         warn!(error = %e, "destroying uhid device");
     }

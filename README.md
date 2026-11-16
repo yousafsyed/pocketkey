@@ -25,17 +25,16 @@ transport Firefox already supports (CTAPHID over USB HID).
 ## How it works
 
 ```
-Firefox ──hidraw──▶ /dev/uhid ──▶ pocketkey ──BLE + wss tunnel──▶ phone
-            CTAPHID        ▲     CTAP2 CBOR        hybrid/caBLE      (authenticator)
-                           │ fd (SCM_RIGHTS)
-              pocketkey-uhid-helper (root, socket-activated, creates the device)
+Firefox ──hidraw──▶ /dev/uhid ──▶ pocketkey-uhid-helper ──▶ pocketkey ──BLE + wss tunnel──▶ phone
+            CTAPHID               (root, holds the fd,  socketpair  CTAP2 CBOR  hybrid/caBLE   (authenticator)
+                                   relays reports only)
 ```
 
 1. A tiny root helper (`pocketkey-uhid-helper`, socket-activated by systemd)
-   creates the virtual HID device with the FIDO usage page and passes the
-   `/dev/uhid` descriptor to the user daemon. Only members of the `pocketkey`
-   group can ask for one (see Security). Firefox finds the key like any
-   security key and performs
+   creates the virtual HID device with the FIDO usage page, keeps the
+   `/dev/uhid` descriptor, and relays HID reports to and from the user daemon
+   over a socketpair. Only members of the `pocketkey` group can ask for one
+   (see Security). Firefox finds the key like any security key and performs
    `CTAPHID_INIT` and `authenticatorGetInfo`. Both are answered locally.
 2. When `getAssertion` or `makeCredential` arrives, a small window opens. If a
    phone was linked before, it gets a push notification ("check your phone");
@@ -160,17 +159,21 @@ every Firefox sign-in, so it is off by default.
   are 128 phones and 1 MiB. The store directory must be owned by your user and
   private (0700), with the file private (0600).
 - Only the root helper (`pocketkey-uhid-helper`) opens `/dev/uhid`. It is
-  socket-activated, hardened with systemd sandboxing, creates one device per
-  user with a fixed FIDO report descriptor, and passes the descriptor to the
-  user daemon. The helper socket is `0660 root:pocketkey`, so only members
-  of the `pocketkey` group can request a device. Treat membership as
-  equivalent to `/dev/uhid` access: the kernel lets whoever holds a `uhid`
-  descriptor destroy the device and create a different one with any report
-  descriptor, so a member could create a keyboard or other input device
-  with it ([#4](https://github.com/yousafsyed/pocketkey/issues/4)). Do not
-  add service accounts to the group. Earlier versions let any local account
-  request a device, and before that granted the whole desktop session
-  `/dev/uhid` via a udev rule; upgrading removes that rule.
+  socket-activated, hardened with systemd sandboxing, and creates one device
+  per user with a fixed FIDO report descriptor. The helper keeps the
+  `/dev/uhid` descriptor and gives the daemon one end of a socketpair; it
+  relays kernel events to the daemon unchanged and forwards back only
+  `UHID_INPUT2` and the two report replies, dropping the session on anything
+  else. The daemon therefore cannot issue `UHID_DESTROY`/`UHID_CREATE2` to
+  re-create the device as a keyboard or any other HID device, which the
+  kernel would otherwise allow the holder of a `uhid` descriptor to do
+  ([#4](https://github.com/yousafsyed/pocketkey/issues/4)). The helper
+  inspects only the 4-byte event type, never report contents. The socket is
+  `0660 root:pocketkey`, so only members of the `pocketkey` group can
+  present a FIDO key at all; that is a policy choice, not what keeps
+  `/dev/uhid` safe. v1.0.0 handed the daemon the raw descriptor and let any
+  local account request one; before that a udev rule granted the whole
+  desktop session `/dev/uhid`. Upgrading removes that rule.
 - Pocketkey's own request/response diagnostics use allowlisted metadata rather
   than raw CBOR values. Detailed logging is scoped to Pocketkey; dependency
   logs stay at `info` or below even with `RUST_LOG=trace`. Treat logs as private
@@ -233,7 +236,10 @@ cargo run --example hidclient            # INIT + getInfo + PING through hidraw
   exists for this user", another pocketkey instance is running for you.
   *Permission denied* on `/run/pocketkey/uhid.sock` means your user is not in
   the `pocketkey` group yet (`id -nG`); add it with
-  `sudo usermod -aG pocketkey $USER` and log in again.
+  `sudo usermod -aG pocketkey $USER` and log in again. "unknown request
+  code" in the helper log means the daemon and helper are different
+  versions; `systemctl restart pocketkey-uhid.socket` after upgrading the
+  helper binary, then restart the user service.
 - *Firefox shows nothing*: confirm Firefox is not the snap (`snap list firefox`
   must be empty) and that `fido2-token -L` lists the device.
 - *QR never completes*: both devices need internet access (tunnel server) and
@@ -256,7 +262,7 @@ Dependencies come from upstream Git/crates.io sources and are resolved in
 regressions. Dependency updates should be reviewed and tested with both phone
 platforms before release.
 
-Layout: `src/uhid.rs` (kernel interface and helper fd-passing protocol),
+Layout: `src/uhid.rs` (uhid event layout, helper handshake and event relay),
 `src/bin/pocketkey-uhid-helper.rs` (root helper), `src/ctaphid.rs` (pure transport
 state machine), `src/ctap2/` (command dispatch and getInfo),
 `src/hybrid/` (phone transport over `pxp`, linked-device store), `src/ui.rs`

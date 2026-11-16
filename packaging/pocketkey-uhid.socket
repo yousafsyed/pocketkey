@@ -5,10 +5,10 @@ Documentation=https://github.com/yousafsyed/pocketkey
 [Socket]
 ListenStream=/run/pocketkey/uhid.sock
 # Only members of the pocketkey group (see sysusers.d/pocketkey.conf) may ask
-# for a device. The descriptor the helper hands out is a raw /dev/uhid fd and
-# the kernel lets its holder destroy the device and create a different one
-# (UHID_DESTROY + UHID_CREATE2 carry no credential check), so it must not be
-# reachable by every local account. The helper enforces one device per uid.
+# for a device. The helper keeps the /dev/uhid descriptor and relays only
+# input reports and report replies, so a member cannot re-create the device
+# as something else; the group restriction is defence in depth and limits
+# who can present a FIDO key at all. The helper enforces one device per uid.
 SocketUser=root
 SocketGroup=pocketkey
 SocketMode=0660

@@ -18,12 +18,16 @@ the phone first). Watch logs in a second terminal:
 | 1.0 | `systemctl status pocketkey-uhid.socket`; `getfacl /dev/uhid` | socket listening; `/dev/uhid` has **no** user ACL entry (root-only) |
 | 1.0a | `ls -l /run/pocketkey/uhid.sock`; `getent group pocketkey` | `srw-rw---- root pocketkey`; the group exists and lists your user |
 | 1.0b | As a user **not** in `pocketkey`: `systemctl --user start pocketkey` | fails with "permission denied ... usermod -aG pocketkey" in `journalctl --user -u pocketkey` |
-| 1.1 | `ls -l /dev/hidraw*` before and after `systemctl --user restart pocketkey` | one new hidraw node; `journalctl -u pocketkey-uhid` shows "handed to user daemon" |
+| 1.1 | `ls -l /dev/hidraw*` before and after `systemctl --user restart pocketkey` | one new hidraw node; `journalctl -u pocketkey-uhid` shows "relaying for user daemon" |
+| 1.1a | `ls -l /proc/$(pidof pocketkey)/fd \| grep uhid` | **nothing**: the daemon holds a socket, not `/dev/uhid`; `ls -l /proc/$(pidof pocketkey-uhid-helper)/fd` shows `/dev/uhid` |
 | 1.2 | `fido2-token -L` | lists `pocketkey virtual FIDO key` (vendor 0x1209, product 0x0001) |
 | 1.3 | `cargo run --example hidclient` | `INIT ok ... caps=0x0d`, getInfo map printed, `PING ok` |
-| 1.4 | `systemctl --user stop pocketkey` | hidraw node disappears (clean `UHID_DESTROY`); helper logs "device slot released" |
-| 1.5 | Start a second `pocketkey` as the same user while the service runs | it exits with "already exists for this user" |
+| 1.4 | `systemctl --user stop pocketkey` | hidraw node disappears; helper logs "user daemon disconnected" then "device destroyed; slot released" |
+| 1.4a | `kill -9 $(pidof pocketkey)` while a device exists | same as 1.4: the kernel closes the daemon's channel end, the helper tears the device down and frees the slot |
+| 1.4b | `cargo test uhid` | the relay allowlist tests pass: `UHID_DESTROY`, `UHID_CREATE2` and unknown types from the daemon end the session and nothing reaches the kernel side (`relay_drops_the_session_on_any_other_daemon_event`, `daemon_cannot_destroy_or_recreate_the_device`) |
+| 1.5 | Start a second `pocketkey` as the same user while the service runs | it exits with "already exists for this user"; repeat after `systemctl --user stop pocketkey` and it starts normally (slot follows the device, #3) |
 | 1.6 | Second desktop user, added to `pocketkey`, logs in | gets their own virtual key |
+| 1.7 | Stop every daemon, wait 60 s | helper logs "idle; exiting"; with any daemon running it stays resident (`pidof pocketkey-uhid-helper`) |
 
 ## M2: getInfo
 
