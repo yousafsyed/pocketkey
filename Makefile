@@ -9,6 +9,7 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 UDEV_RULES_DIR ?= /etc/udev/rules.d
 MODULES_LOAD_DIR ?= /etc/modules-load.d
+SYSUSERS_DIR ?= /etc/sysusers.d
 SYSTEM_UNIT_DIR ?= /etc/systemd/system
 USER_UNIT_DIR ?= $(HOME)/.config/systemd/user
 FEATURES ?=
@@ -38,13 +39,21 @@ install:
 	# Older installs granted the whole desktop session /dev/uhid; remove that.
 	rm -f $(DESTDIR)$(UDEV_RULES_DIR)/60-pocketkey.rules $(DESTDIR)$(UDEV_RULES_DIR)/99-pocketkey.rules
 	install -Dm644 packaging/pocketkey-modules.conf $(DESTDIR)$(MODULES_LOAD_DIR)/pocketkey.conf
+	install -Dm644 packaging/pocketkey-sysusers.conf $(DESTDIR)$(SYSUSERS_DIR)/pocketkey.conf
+	install -d $(DESTDIR)$(SYSTEM_UNIT_DIR)
 	sed 's|^ExecStart=.*|ExecStart=$(BINDIR)/pocketkey-uhid-helper|' packaging/pocketkey-uhid.service > $(DESTDIR)$(SYSTEM_UNIT_DIR)/pocketkey-uhid.service
 	install -Dm644 packaging/pocketkey-uhid.socket $(DESTDIR)$(SYSTEM_UNIT_DIR)/pocketkey-uhid.socket
 	@if [ -z "$(DESTDIR)" ]; then \
 		udevadm control --reload; \
 		modprobe uhid; \
+		systemd-sysusers $(SYSUSERS_DIR)/pocketkey.conf; \
+		if [ -n "$(SUDO_USER)" ] && ! id -nG "$(SUDO_USER)" | tr ' ' '\n' | grep -qx pocketkey; then \
+			usermod -aG pocketkey "$(SUDO_USER)"; \
+			echo "added $(SUDO_USER) to the pocketkey group; log out and back in before 'make install-user'"; \
+		fi; \
 		systemctl daemon-reload; \
-		systemctl enable --now pocketkey-uhid.socket; \
+		systemctl restart pocketkey-uhid.socket; \
+		systemctl enable pocketkey-uhid.socket; \
 	fi
 
 install-user:
@@ -59,6 +68,8 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/pocketkey $(DESTDIR)$(BINDIR)/pocketkey-uhid-helper
 	rm -f $(DESTDIR)$(SYSTEM_UNIT_DIR)/pocketkey-uhid.socket $(DESTDIR)$(SYSTEM_UNIT_DIR)/pocketkey-uhid.service
 	rm -f $(DESTDIR)$(UDEV_RULES_DIR)/60-pocketkey.rules $(DESTDIR)$(MODULES_LOAD_DIR)/pocketkey.conf
+	# The pocketkey group is left in place, like packages do; `groupdel pocketkey` removes it.
+	rm -f $(DESTDIR)$(SYSUSERS_DIR)/pocketkey.conf
 	-systemctl daemon-reload
 	-udevadm control --reload
 

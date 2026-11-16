@@ -1,6 +1,9 @@
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
+    # The helper socket is 0660 root:pocketkey; create the group before the
+    # debhelper snippet below starts the socket.
+    systemd-sysusers /usr/lib/sysusers.d/pocketkey.conf
     # Versions before 0.2 granted the whole desktop session access to
     # /dev/uhid through a udev rule. The privileged helper replaces that.
     rm -f /etc/udev/rules.d/60-pocketkey.rules /etc/udev/rules.d/99-pocketkey.rules
