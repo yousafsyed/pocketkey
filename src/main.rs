@@ -312,24 +312,43 @@ fn handle_event(
                         send_all(device, &hid.respond(id, &[ctap2::status::CTAP1_ERR_OTHER]))?;
                         return Ok(());
                     }
-                    info!(?hint, "forwarding request to the phone");
-                    let _ = status_tx.send(Status::Starting);
+                    // Start the phone flow straight away: pocketkey exists for
+                    // browsers with no hybrid flow of their own (Firefox), where
+                    // a confirmation click would be pure friction. Chrome, which
+                    // has its own QR, dispatches to every transport at once and
+                    // sends CANCEL the moment the user picks its own dialog; that
+                    // closes ours silently. POCKETKEY_ASK=1 opts into asking first.
+                    let ask = ask_before_phone_flow();
+                    info!(?hint, ask, "request for the phone");
                     let _ = request_tx.send(Some(id));
                     let cancel = CancellationToken::new();
                     // Give each task its own progress channel. The event loop
                     // alone publishes UI state, so a cancelled task cannot
                     // overwrite a later request's status.
-                    let (progress_tx, progress_rx) = watch::channel(Status::Starting);
+                    let initial = if ask {
+                        Status::Selecting
+                    } else {
+                        Status::Starting
+                    };
+                    let _ = status_tx.send(initial.clone());
+                    let (progress_tx, progress_rx) = watch::channel(initial);
+                    let (selected, selection_rx) = oneshot::channel();
                     let task = tokio::spawn({
                         let transport = Arc::clone(transport);
                         let cancel = cancel.clone();
-                        async move { transport.ctap(frame, hint, progress_tx, cancel).await }
+                        async move {
+                            if ask {
+                                wait_for_selection(selection_rx, cancel.clone()).await?;
+                                let _ = progress_tx.send(Status::Starting);
+                            }
+                            transport.ctap(frame, hint, progress_tx, cancel).await
+                        }
                     });
                     *active = Some(Active {
                         id,
                         task,
                         cancel,
-                        selection: None,
+                        selection: if ask { Some(selected) } else { None },
                         progress: Some(progress_rx),
                     });
                 }
@@ -372,6 +391,14 @@ fn handle_event(
         Event::RejectedCbor { cid } => ctap.reject_channel(cid),
     }
     Ok(())
+}
+
+/// `POCKETKEY_ASK=1` shows a "use your phone for this sign-in?" step before the
+/// QR. Off by default: Firefox has no chooser of its own, so the click would be
+/// pure friction. Useful only if you also use pocketkey from Chrome and would
+/// rather not see our QR next to Chrome's native one.
+fn ask_before_phone_flow() -> bool {
+    std::env::var_os("POCKETKEY_ASK").is_some_and(|v| v == "1" || v == "true")
 }
 
 async fn wait_for_selection(
@@ -480,6 +507,54 @@ mod tests {
         assert_eq!(completion_status(&[0x2d]), Status::Idle);
         assert!(matches!(completion_status(&[0x27]), Status::Failed(_)));
         assert!(matches!(completion_status(&[]), Status::Failed(_)));
+    }
+
+    #[test]
+    fn asking_first_is_opt_in_only() {
+        // Default: start the phone flow immediately. Firefox (the audience)
+        // has no chooser, so a confirmation click there is pure friction.
+        std::env::remove_var("POCKETKEY_ASK");
+        assert!(!ask_before_phone_flow());
+        std::env::set_var("POCKETKEY_ASK", "0");
+        assert!(!ask_before_phone_flow());
+        std::env::set_var("POCKETKEY_ASK", "1");
+        assert!(ask_before_phone_flow());
+        std::env::set_var("POCKETKEY_ASK", "true");
+        assert!(ask_before_phone_flow());
+        std::env::remove_var("POCKETKEY_ASK");
+    }
+
+    #[tokio::test]
+    async fn opt_in_ask_does_not_start_the_phone_flow_until_selected() {
+        // Models the Forward path with POCKETKEY_ASK on: the transport future
+        // must not be polled before the user selects; cancel (Chrome picking
+        // its own QR) must end it with Cancelled and never reach the transport.
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let run = |selected: oneshot::Receiver<()>, cancel: CancellationToken| {
+            let started = started.clone();
+            async move {
+                wait_for_selection(selected, cancel.clone()).await?;
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<Vec<u8>, HybridError>(vec![0])
+            }
+        };
+
+        let (tx, rx) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run(rx, cancel.clone()));
+        tokio::task::yield_now().await;
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        cancel.cancel();
+        assert_eq!(task.await.unwrap(), Err(HybridError::Cancelled));
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        drop(tx);
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(run(rx, CancellationToken::new()));
+        tokio::task::yield_now().await;
+        tx.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), Ok(vec![0]));
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test(start_paused = true)]
