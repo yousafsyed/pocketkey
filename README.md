@@ -29,9 +29,9 @@ Firefox ──hidraw──▶ /dev/uhid ──▶ pocketkey ──BLE + wss tunn
 
 1. A tiny root helper (`pocketkey-uhid-helper`, socket-activated by systemd)
    creates the virtual HID device with the FIDO usage page and passes the
-   `/dev/uhid` descriptor to the user daemon. The user session never gets
-   access to `/dev/uhid` itself, so nothing in it can create other virtual
-   input devices. Firefox finds the key like any security key and performs
+   `/dev/uhid` descriptor to the user daemon. Only members of the `pocketkey`
+   group can ask for one (see Security). Firefox finds the key like any
+   security key and performs
    `CTAPHID_INIT` and `authenticatorGetInfo`. Both are answered locally.
 2. When `getAssertion` or `makeCredential` arrives, a small window opens. If a
    phone was linked before, it gets a push notification ("check your phone");
@@ -75,15 +75,20 @@ From source:
 sudo apt install build-essential pkg-config libdbus-1-dev     # build deps
 sudo apt install fido2-tools                                   # optional, for testing
 cargo build --release    # as your user
-sudo make install        # binaries + root uhid helper (socket-activated)
+sudo make install        # binaries + root uhid helper (socket-activated); adds you to the pocketkey group
 make install-user        # systemd user service, enabled and started
 ```
+
+`make install` adds the invoking user (`$SUDO_USER`) to the `pocketkey` group.
+Group membership takes effect at the next login, so log out and back in
+before `make install-user` on a first install.
 
 Or install the `.deb` from the [latest release](https://github.com/yousafsyed/pocketkey/releases/latest)
 (built on Ubuntu 24.04, works on 24.04 and newer):
 
 ```sh
 sudo apt install ./pocketkey_*_amd64.deb
+sudo usermod -aG pocketkey $USER      # then log out and back in
 systemctl --user start pocketkey      # starts automatically at your next login
 ```
 
@@ -145,13 +150,17 @@ pocketkey window; selection no longer happens automatically.
   are 128 phones and 1 MiB. The store directory must be owned by your user and
   private (0700), with the file private (0600).
 - Only the root helper (`pocketkey-uhid-helper`) opens `/dev/uhid`. It is
-  socket-activated, hardened with systemd sandboxing, creates exactly one
-  device per user with a fixed FIDO report descriptor, and passes the
-  descriptor to the user daemon. A `uhid` descriptor can only emit reports
-  for the device it already created, so the user session cannot turn it
-  into a keyboard or any other input device. Earlier versions granted the
-  whole desktop session access to `/dev/uhid` via a udev rule; upgrading
-  removes that rule.
+  socket-activated, hardened with systemd sandboxing, creates one device per
+  user with a fixed FIDO report descriptor, and passes the descriptor to the
+  user daemon. The helper socket is `0660 root:pocketkey`, so only members
+  of the `pocketkey` group can request a device. Treat membership as
+  equivalent to `/dev/uhid` access: the kernel lets whoever holds a `uhid`
+  descriptor destroy the device and create a different one with any report
+  descriptor, so a member could create a keyboard or other input device
+  with it ([#4](https://github.com/yousafsyed/pocketkey/issues/4)). Do not
+  add service accounts to the group. Earlier versions let any local account
+  request a device, and before that granted the whole desktop session
+  `/dev/uhid` via a udev rule; upgrading removes that rule.
 - Pocketkey's own request/response diagnostics use allowlisted metadata rather
   than raw CBOR values. Detailed logging is scoped to Pocketkey; dependency
   logs stay at `info` or below even with `RUST_LOG=trace`. Treat logs as private
@@ -160,9 +169,6 @@ pocketkey window; selection no longer happens automatically.
   HID channel IDs multiplex clients; they are not an authorization boundary.
   Resource limits prevent unbounded channel allocation, but a malicious local
   client can still compete with legitimate requests.
-- Any local user can ask the helper for a virtual FIDO key (one per user).
-  That only lets them present a FIDO device to their own session, which
-  they could do with real hardware anyway.
 
 ## Limitations
 
@@ -204,6 +210,9 @@ cargo run --example hidclient            # INIT + getInfo + PING through hidraw
   (`lsmod | grep uhid`; `sudo modprobe uhid`). The helper logs to
   `journalctl -u pocketkey-uhid`. If the helper reports the device "already
   exists for this user", another pocketkey instance is running for you.
+  *Permission denied* on `/run/pocketkey/uhid.sock` means your user is not in
+  the `pocketkey` group yet (`id -nG`); add it with
+  `sudo usermod -aG pocketkey $USER` and log in again.
 - *Firefox shows nothing*: confirm Firefox is not the snap (`snap list firefox`
   must be empty) and that `fido2-token -L` lists the device.
 - *QR never completes*: both devices need internet access (tunnel server) and

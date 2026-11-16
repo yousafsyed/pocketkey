@@ -154,6 +154,17 @@ impl UhidDevice {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 debug!("uhid helper socket not present; opening /dev/uhid directly");
             }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{}: permission denied. Only members of the pocketkey group may \
+                         request a virtual FIDO device; run `sudo usermod -aG pocketkey $USER` \
+                         and log in again",
+                        helper::SOCKET_PATH
+                    ),
+                ));
+            }
             Err(e) => return Err(e),
         }
         Self::create_at(Path::new("/dev/uhid"))

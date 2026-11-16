@@ -3,13 +3,18 @@
 //! systemd socket-activates this as root on `/run/pocketkey/uhid.sock`. A
 //! connecting user daemon sends one request byte; the helper creates the
 //! virtual FIDO device (fixed report descriptor, fixed VID/PID) and passes the
-//! `/dev/uhid` descriptor back over the socket, then closes its own copy. The
-//! user session therefore never gets access to `/dev/uhid` and cannot create
-//! arbitrary input devices: a uhid descriptor only emits input reports for the
-//! device it already created, and that device is a FIDO key.
+//! `/dev/uhid` descriptor back over the socket, then closes its own copy.
 //!
-//! Policy: any local user may request a device, one device per uid at a time.
-//! The helper does no parsing of structured data, no networking and no CTAP.
+//! The descriptor is a plain `/dev/uhid` fd. The kernel does not tie it to the
+//! device the helper created: its holder can issue `UHID_DESTROY` and then
+//! `UHID_CREATE2` with any report descriptor (neither carries a credential
+//! check), so handing it out is equivalent to granting `/dev/uhid` access. The
+//! socket unit therefore restricts connections to the `pocketkey` group
+//! (`0660 root:pocketkey`); see issue #4.
+//!
+//! Policy: members of the `pocketkey` group may request a device, one device
+//! per uid at a time. The helper does no parsing of structured data, no
+//! networking and no CTAP.
 
 use std::collections::HashMap;
 use std::fs::File;
