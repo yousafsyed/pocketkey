@@ -90,10 +90,16 @@ Or install the `.deb` from the [latest release](https://github.com/yousafsyed/po
 (built on Ubuntu 24.04, works on 24.04 and newer):
 
 ```sh
-sudo apt install ./pocketkey_*_amd64.deb
-sudo usermod -aG pocketkey $USER      # then log out and back in
-systemctl --user start pocketkey      # starts automatically at your next login
+sudo apt install ./pocketkey_*_amd64.deb   # adds you to the pocketkey group
+# log out and back in, then:
+systemctl --user start pocketkey           # starts automatically at later logins
 ```
+
+Like `make install`, the package adds the user who ran `sudo` to the
+`pocketkey` group. If it was installed another way (unattended, or a software
+centre), run `sudo usermod -aG pocketkey $USER` yourself. Either way the new
+group only applies after logging in again; until then the user service fails
+with a "permission denied … usermod" message.
 
 To build the package yourself: `make deb` (needs `debhelper`, `dpkg-dev`,
 `libdbus-1-dev` and a rustup toolchain ≥ 1.88); the result lands in the
