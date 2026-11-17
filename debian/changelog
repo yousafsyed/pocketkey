@@ -1,3 +1,9 @@
+pocketkey (2.0.0-1) unstable; urgency=medium
+
+  * Release 2.0.0. Changes: https://github.com/yousafsyed/pocketkey/releases/tag/v2.0.0
+
+ -- github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>  Tue, 17 Nov 2026 09:54:48 +0000
+
 pocketkey (1.0.0-1) unstable; urgency=medium
 
   * Release 1.0.0. Changes: https://github.com/yousafsyed/pocketkey/releases/tag/v1.0.0
