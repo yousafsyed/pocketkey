@@ -10,8 +10,9 @@ Type=simple
 # ProtectKernelModules below forbids loading it from here.
 ExecStart=/usr/bin/pocketkey-uhid-helper
 Environment=RUST_LOG=info
-# The helper only opens /dev/uhid, issues one UHID_CREATE2 and passes the
-# descriptor over the socket. Lock everything else down. It runs as uid 0
+# The helper opens /dev/uhid, issues one UHID_CREATE2 per user and relays
+# events to the user daemon over a socketpair, forwarding only input reports
+# and report replies back. Lock everything else down. It runs as uid 0
 # because /dev/uhid is root-only (0600); no capabilities are needed for that,
 # so the bounding set is emptied.
 DeviceAllow=/dev/uhid rw

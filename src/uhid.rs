@@ -1,4 +1,4 @@
-//! Virtual HID device over `/dev/uhid`.
+//! Virtual HID device over `/dev/uhid`, reached through the privileged helper.
 //!
 //! The uhid ABI (`linux/uhid.h`) is a single packed `struct uhid_event`
 //! (`u32 type` followed by a union of request structs) written to and read
@@ -6,14 +6,23 @@
 //! the build needs no bindgen or system headers. Layout constants are checked
 //! by unit tests against the values from the kernel header.
 //!
-//! Lifecycle: write `UHID_CREATE2`, then the kernel sends `UHID_START`,
-//! `UHID_OPEN` when a program opens the hidraw node, `UHID_OUTPUT` for each
-//! report the host writes, `UHID_CLOSE`/`UHID_STOP` on the way down. We send
-//! `UHID_INPUT2` for each report to the host and `UHID_DESTROY` on shutdown.
+//! Only `pocketkey-uhid-helper` (root) opens `/dev/uhid`. It writes
+//! `UHID_CREATE2` and keeps that descriptor; the daemon gets one end of a
+//! `SOCK_SEQPACKET` socketpair on which the helper relays events in both
+//! directions, forwarding to the kernel only `UHID_INPUT2` and the two report
+//! replies. Record boundaries on the socketpair match event boundaries on the
+//! character device, so the daemon reads and writes `struct uhid_event` as if
+//! it held the device itself. Closing the daemon's end makes the helper close
+//! `/dev/uhid`, which destroys the device; no `UHID_DESTROY` is ever sent.
+//!
+//! Lifecycle as seen by the daemon: the kernel sends `UHID_START`, `UHID_OPEN`
+//! when a program opens the hidraw node, `UHID_OUTPUT` for each report the host
+//! writes, `UHID_CLOSE`/`UHID_STOP` on the way down. We send `UHID_INPUT2` for
+//! each report to the host.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 
 use tokio::io::unix::AsyncFd;
@@ -51,6 +60,8 @@ pub const PRODUCT_ID: u32 = 0x0001;
 
 // struct uhid_event layout -------------------------------------------------
 
+/// Never sent by the daemon; the helper refuses it (see `helper::relay`).
+#[cfg_attr(not(test), allow(dead_code))]
 const UHID_DESTROY: u32 = 1;
 const UHID_START: u32 = 2;
 const UHID_STOP: u32 = 3;
@@ -135,73 +146,52 @@ pub enum UhidEvent {
 }
 
 pub struct UhidDevice {
+    /// The daemon's end of the helper's socketpair, not `/dev/uhid` itself.
     fd: AsyncFd<File>,
-    destroyed: bool,
 }
 
 impl UhidDevice {
-    /// Obtain the virtual FIDO device. Prefers the privileged helper socket
-    /// (see `pocketkey-uhid-helper`), which hands over a descriptor for a
-    /// device whose descriptor is fixed to the FIDO usage page, so the user
-    /// session never needs access to `/dev/uhid` itself. Falls back to opening
-    /// `/dev/uhid` directly for installs without the helper.
+    /// Obtain the virtual FIDO device from the privileged helper (see
+    /// `pocketkey-uhid-helper`). The helper creates the device with the fixed
+    /// FIDO report descriptor, keeps the `/dev/uhid` descriptor, and relays
+    /// events over the returned channel, so the user session can neither reach
+    /// `/dev/uhid` nor re-create the device as something else.
     pub fn create() -> io::Result<Self> {
-        match helper::request_device(Path::new(helper::SOCKET_PATH)) {
-            Ok(file) => {
-                debug!(socket = helper::SOCKET_PATH, "device received from helper");
-                return Self::from_created(file);
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                debug!("uhid helper socket not present; opening /dev/uhid directly");
-            }
-            Err(e) => return Err(e),
-        }
-        Self::create_at(Path::new("/dev/uhid"))
-    }
-
-    pub fn create_at(path: &Path) -> io::Result<Self> {
-        let file = open_uhid(path).map_err(|e| {
-            if e.kind() == io::ErrorKind::PermissionDenied {
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "{}: permission denied. Install and start the pocketkey-uhid helper \
-                         (`sudo make install` installs its socket unit), or grant this user \
-                         access to /dev/uhid",
-                        path.display()
-                    ),
-                )
-            } else {
-                e
-            }
+        let socket = Path::new(helper::SOCKET_PATH);
+        let channel = helper::request_device(socket).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => io::Error::new(
+                e.kind(),
+                format!(
+                    "{}: the pocketkey-uhid helper socket is not present. Install it with \
+                     `sudo make install` (or the .deb) and check \
+                     `systemctl status pocketkey-uhid.socket`",
+                    socket.display()
+                ),
+            ),
+            io::ErrorKind::PermissionDenied => io::Error::new(
+                e.kind(),
+                format!(
+                    "{}: permission denied. Only members of the pocketkey group may \
+                     request a virtual FIDO device; run `sudo usermod -aG pocketkey $USER` \
+                     and log in again",
+                    socket.display()
+                ),
+            ),
+            _ => e,
         })?;
-        let mut dev = Self::wrap(file)?;
-        dev.write_event(&create2_event())?;
-        debug!(
-            name = DEVICE_NAME,
-            vid = VENDOR_ID,
-            pid = PRODUCT_ID,
-            "uhid device created"
-        );
-        Ok(dev)
+        debug!(socket = %socket.display(), "device channel received from helper");
+        Self::from_channel(channel)
     }
 
-    /// Wrap a `/dev/uhid` descriptor on which `UHID_CREATE2` has already been
-    /// issued (by the privileged helper).
-    pub fn from_created(file: File) -> io::Result<Self> {
+    /// Wrap the daemon's end of the helper's event channel.
+    pub fn from_channel(channel: OwnedFd) -> io::Result<Self> {
+        let file = File::from(channel);
         set_nonblocking_cloexec(&file)?;
-        Self::wrap(file)
-    }
-
-    fn wrap(file: File) -> io::Result<Self> {
         // SAFETY: `file` owns the descriptor for the lifetime of the AsyncFd
         // and nothing else closes or duplicates it (the I/O-safety contract
         // `register` asks the caller to uphold).
         let fd = unsafe { AsyncFd::register(file)? };
-        Ok(Self {
-            fd,
-            destroyed: false,
-        })
+        Ok(Self { fd })
     }
 
     /// Wait for the next event that matters to the caller. `UHID_START` and
@@ -323,21 +313,26 @@ impl UhidDevice {
         self.write_event(&ev)
     }
 
-    /// Tear the device down. Idempotent; also called from `Drop`.
+    /// Tear the device down: shut the channel so the helper closes
+    /// `/dev/uhid` and the kernel removes the hidraw node. Idempotent;
+    /// dropping the device has the same effect.
     pub fn destroy(&mut self) -> io::Result<()> {
-        if self.destroyed {
-            return Ok(());
+        // SAFETY: shutdown on a socket descriptor we own; ENOTCONN after a
+        // previous shutdown is the idempotent case.
+        let rc = unsafe { libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOTCONN) {
+                return Err(err);
+            }
         }
-        self.destroyed = true;
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[..4].copy_from_slice(&UHID_DESTROY.to_le_bytes());
-        self.write_event(&ev)?;
-        debug!("uhid device destroyed");
+        debug!("uhid device channel closed");
         Ok(())
     }
 
-    /// uhid writes never block (the kernel copies the event synchronously),
-    /// so a plain write on the non-blocking fd is fine.
+    /// The helper drains the channel promptly and relays to `/dev/uhid`,
+    /// whose writes never block, so a plain send on the non-blocking end is
+    /// fine. A full socket buffer means the helper is gone or wedged.
     fn write_event(&mut self, ev: &[u8; UHID_EVENT_SIZE]) -> io::Result<()> {
         let n = self.fd.get_mut().write(ev)?;
         if n != ev.len() {
@@ -347,14 +342,6 @@ impl UhidDevice {
             ));
         }
         Ok(())
-    }
-}
-
-impl Drop for UhidDevice {
-    fn drop(&mut self) {
-        if let Err(e) = self.destroy() {
-            warn!(error = %e, "failed to destroy uhid device");
-        }
     }
 }
 
@@ -372,16 +359,7 @@ fn report_from_output(data: &[u8]) -> Option<Report> {
     Some(report)
 }
 
-fn open_uhid(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-}
-
 fn set_nonblocking_cloexec(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
     let fd = file.as_raw_fd();
     // SAFETY: fcntl on a descriptor we own; flags are plain integers.
     unsafe {
@@ -397,13 +375,17 @@ fn set_nonblocking_cloexec(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// The privileged helper protocol: the daemon connects to the helper's Unix
-/// socket and receives one `/dev/uhid` descriptor with the FIDO device already
-/// created, via `SCM_RIGHTS`. Both sides of the protocol live here so the
-/// helper binary and the daemon cannot drift apart.
+/// The privileged helper protocol. The daemon connects to the helper's Unix
+/// socket, sends one request byte and receives, via `SCM_RIGHTS`, one end of
+/// a `SOCK_SEQPACKET` socketpair. The helper keeps the `/dev/uhid` descriptor
+/// and relays events between the two for as long as the daemon holds its end.
+/// Both sides of the protocol live here so the helper binary and the daemon
+/// cannot drift apart.
 pub mod helper {
     use super::*;
+    use std::fs::OpenOptions;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
@@ -411,27 +393,37 @@ pub mod helper {
     pub const SOCKET_PATH: &str = "/run/pocketkey/uhid.sock";
     /// Single-byte request/response codes. Deliberately tiny: no parsing of
     /// untrusted structured data happens in the privileged process.
-    pub const REQUEST_DEVICE: u8 = 0x01;
+    ///
+    /// `0x01` was the v1.0 request for a raw `/dev/uhid` descriptor and is no
+    /// longer served; a mismatched daemon/helper pair fails loudly instead
+    /// of half-working.
+    pub const REQUEST_CHANNEL: u8 = 0x02;
     pub const REPLY_DEVICE: u8 = 0x01;
     pub const REPLY_BUSY: u8 = 0x02;
     pub const REPLY_ERROR: u8 = 0x03;
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Client side: ask the helper for a created device descriptor.
-    pub fn request_device(socket: &Path) -> io::Result<File> {
+    /// Client side: ask the helper for a device and receive the daemon's end
+    /// of the event channel.
+    pub fn request_device(socket: &Path) -> io::Result<OwnedFd> {
         let stream = UnixStream::connect(socket)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        send_byte(&stream, REQUEST_DEVICE, None)?;
+        send_byte(&stream, REQUEST_CHANNEL, None)?;
         let (code, fd) = recv_byte(&stream)?;
         match (code, fd) {
-            (REPLY_DEVICE, Some(fd)) => Ok(File::from(fd)),
+            (REPLY_DEVICE, Some(fd)) => Ok(fd),
+            (REPLY_DEVICE, None) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the uhid helper replied without a channel descriptor",
+            )),
             (REPLY_BUSY, _) => Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "the uhid helper reports a virtual FIDO device already exists for this user",
             )),
             (REPLY_ERROR, _) => Err(io::Error::other(
-                "the uhid helper could not create the virtual FIDO device (see its journal)",
+                "the uhid helper could not create the virtual FIDO device (see its journal); \
+                 if it was just upgraded, both daemon and helper must be the same version",
             )),
             (code, _) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -440,11 +432,14 @@ pub mod helper {
         }
     }
 
-    /// Helper side: create the device on `/dev/uhid`. The returned descriptor
-    /// is passed to the client and then closed here; the device lives as long
-    /// as the client keeps it open.
-    pub fn create_device_for_client(uhid_path: &Path) -> io::Result<File> {
-        let mut file = open_uhid(uhid_path)?;
+    /// Helper side: open `/dev/uhid` and create the device. The helper keeps
+    /// this descriptor for the device's lifetime; it is never passed out.
+    pub fn create_device(uhid_path: &Path) -> io::Result<File> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(uhid_path)?;
         let ev = create2_event();
         let n = file.write(&ev)?;
         if n != ev.len() {
@@ -454,6 +449,155 @@ pub mod helper {
             ));
         }
         Ok(file)
+    }
+
+    /// Helper side: the event channel. `SOCK_SEQPACKET` keeps one
+    /// `struct uhid_event` per record, matching the character device.
+    /// Returns `(helper_end, daemon_end)`.
+    pub fn channel_pair() -> io::Result<(OwnedFd, OwnedFd)> {
+        let mut fds = [-1 as libc::c_int; 2];
+        // SAFETY: socketpair writes two descriptors into the array.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both descriptors are fresh and owned by nothing else.
+        Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    }
+
+    /// Event types the daemon may send to the kernel. Everything else,
+    /// `UHID_DESTROY` and `UHID_CREATE2` in particular, ends the session.
+    pub const DAEMON_ALLOWED_EVENTS: [u32; 3] =
+        [UHID_INPUT2, UHID_GET_REPORT_REPLY, UHID_SET_REPORT_REPLY];
+
+    /// Why a relay session ended.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum RelayEnd {
+        /// The daemon closed its end of the channel (normal shutdown).
+        DaemonClosed,
+        /// The daemon sent an event type outside `DAEMON_ALLOWED_EVENTS`.
+        DaemonViolation(u32),
+        /// The kernel side closed or failed.
+        KernelClosed,
+        Io(io::ErrorKind),
+    }
+
+    /// Helper side: shuttle events between `/dev/uhid` and the daemon's
+    /// channel until one side ends. Runs on a dedicated thread per device.
+    /// Kernel events go to the daemon unchanged. Daemon events are forwarded
+    /// only when their 4-byte type is in `DAEMON_ALLOWED_EVENTS`; nothing
+    /// beyond the type is inspected. On return the caller drops `uhid`, which
+    /// destroys the device.
+    pub fn relay(uhid: &File, channel: &OwnedFd) -> RelayEnd {
+        let mut fds = [
+            libc::pollfd {
+                fd: uhid.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: channel.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let mut buf = [0u8; UHID_EVENT_SIZE];
+        loop {
+            // SAFETY: fds is a valid two-element array for the call.
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return RelayEnd::Io(err.kind());
+            }
+            let hangup = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+
+            if fds[0].revents & libc::POLLIN != 0 {
+                match read_fd(uhid.as_raw_fd(), &mut buf) {
+                    Ok(0) => return RelayEnd::KernelClosed,
+                    Ok(n) => {
+                        if let Err(e) = write_all_fd(channel.as_raw_fd(), &buf[..n]) {
+                            return match e.kind() {
+                                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset => {
+                                    RelayEnd::DaemonClosed
+                                }
+                                kind => RelayEnd::Io(kind),
+                            };
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return RelayEnd::Io(e.kind()),
+                }
+            } else if fds[0].revents & hangup != 0 {
+                return RelayEnd::KernelClosed;
+            }
+
+            if fds[1].revents & libc::POLLIN != 0 {
+                match read_fd(channel.as_raw_fd(), &mut buf) {
+                    Ok(0) => return RelayEnd::DaemonClosed,
+                    Ok(n) => {
+                        if n < 4 {
+                            return RelayEnd::DaemonViolation(u32::MAX);
+                        }
+                        let ty = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        if !DAEMON_ALLOWED_EVENTS.contains(&ty) {
+                            return RelayEnd::DaemonViolation(ty);
+                        }
+                        if let Err(e) = write_all_fd(uhid.as_raw_fd(), &buf[..n]) {
+                            return RelayEnd::Io(e.kind());
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                        ) =>
+                    {
+                        return RelayEnd::DaemonClosed
+                    }
+                    Err(e) => return RelayEnd::Io(e.kind()),
+                }
+            } else if fds[1].revents & hangup != 0 {
+                return RelayEnd::DaemonClosed;
+            }
+        }
+    }
+
+    fn read_fd(fd: libc::c_int, buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: buf is valid for buf.len() bytes.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+
+    /// A `struct uhid_event` is written whole or not at all on both the
+    /// character device and a seqpacket socket, so a short write is an error.
+    /// Rust's runtime ignores SIGPIPE, so a closed peer surfaces as EPIPE.
+    fn write_all_fd(fd: libc::c_int, data: &[u8]) -> io::Result<()> {
+        // SAFETY: data is valid for data.len() bytes.
+        let n = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n as usize != data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!("short write: {n} of {} bytes", data.len()),
+            ));
+        }
+        Ok(())
     }
 
     /// Send one code byte, optionally with a descriptor attached.
@@ -627,6 +771,130 @@ pub mod helper {
             assert_eq!(err.kind(), io::ErrorKind::NotFound);
         }
 
+        /// A seqpacket pair stands in for `/dev/uhid`: `kernel` is what the
+        /// kernel would hold, `uhid` what the helper opened.
+        fn relay_fixture() -> (File, OwnedFd, OwnedFd, OwnedFd) {
+            let (uhid, kernel) = channel_pair().unwrap();
+            let (helper_end, daemon_end) = channel_pair().unwrap();
+            (File::from(uhid), kernel, helper_end, daemon_end)
+        }
+
+        fn event(ty: u32) -> [u8; UHID_EVENT_SIZE] {
+            let mut ev = [0u8; UHID_EVENT_SIZE];
+            ev[..4].copy_from_slice(&ty.to_le_bytes());
+            ev
+        }
+
+        fn send(fd: &OwnedFd, data: &[u8]) {
+            write_all_fd(fd.as_raw_fd(), data).unwrap();
+        }
+
+        fn recv_blocking(fd: &OwnedFd) -> Vec<u8> {
+            let mut pfd = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: single valid pollfd.
+            assert!(unsafe { libc::poll(&mut pfd, 1, 5000) } > 0, "timed out");
+            let mut buf = vec![0u8; UHID_EVENT_SIZE];
+            let n = read_fd(fd.as_raw_fd(), &mut buf).unwrap();
+            buf.truncate(n);
+            buf
+        }
+
+        fn spawn_relay(uhid: File, helper_end: OwnedFd) -> std::thread::JoinHandle<RelayEnd> {
+            std::thread::spawn(move || relay(&uhid, &helper_end))
+        }
+
+        #[test]
+        fn relay_forwards_kernel_events_to_the_daemon_unchanged() {
+            let (uhid, kernel, helper_end, daemon_end) = relay_fixture();
+            let handle = spawn_relay(uhid, helper_end);
+
+            let mut ev = event(UHID_OUTPUT);
+            ev[output::DATA..output::DATA + 4].copy_from_slice(b"ping");
+            send(&kernel, &ev);
+            assert_eq!(recv_blocking(&daemon_end), ev.to_vec());
+
+            // Short events (the kernel sends sizeof(uhid_event), but be lenient).
+            send(&kernel, &UHID_STOP.to_le_bytes());
+            assert_eq!(recv_blocking(&daemon_end), UHID_STOP.to_le_bytes());
+
+            drop(daemon_end);
+            assert_eq!(handle.join().unwrap(), RelayEnd::DaemonClosed);
+        }
+
+        #[test]
+        fn relay_forwards_allowed_daemon_events_to_the_kernel() {
+            let (uhid, kernel, helper_end, daemon_end) = relay_fixture();
+            let handle = spawn_relay(uhid, helper_end);
+
+            for ty in DAEMON_ALLOWED_EVENTS {
+                let mut ev = event(ty);
+                ev[4..8].copy_from_slice(&[1, 2, 3, 4]);
+                send(&daemon_end, &ev);
+                assert_eq!(recv_blocking(&kernel), ev.to_vec(), "type {ty}");
+            }
+
+            drop(daemon_end);
+            assert_eq!(handle.join().unwrap(), RelayEnd::DaemonClosed);
+        }
+
+        #[test]
+        fn relay_drops_the_session_on_any_other_daemon_event() {
+            for ty in [
+                UHID_DESTROY,
+                UHID_CREATE2,
+                UHID_START,
+                UHID_OUTPUT,
+                0xdead_beef,
+            ] {
+                let (uhid, kernel, helper_end, daemon_end) = relay_fixture();
+                let handle = spawn_relay(uhid, helper_end);
+
+                send(&daemon_end, &event(ty));
+                assert_eq!(handle.join().unwrap(), RelayEnd::DaemonViolation(ty));
+
+                // Nothing reached the kernel side: the relay dropped its uhid
+                // end, so the only thing left to read is EOF.
+                let mut buf = [0u8; UHID_EVENT_SIZE];
+                assert_eq!(
+                    read_fd(kernel.as_raw_fd(), &mut buf).unwrap(),
+                    0,
+                    "type {ty} leaked"
+                );
+            }
+        }
+
+        #[test]
+        fn relay_rejects_a_truncated_type_field() {
+            let (uhid, _kernel, helper_end, daemon_end) = relay_fixture();
+            let handle = spawn_relay(uhid, helper_end);
+            send(&daemon_end, &[0x0c, 0x00]);
+            assert_eq!(handle.join().unwrap(), RelayEnd::DaemonViolation(u32::MAX));
+        }
+
+        #[test]
+        fn relay_ends_when_the_kernel_side_closes() {
+            let (uhid, kernel, helper_end, _daemon_end) = relay_fixture();
+            let handle = spawn_relay(uhid, helper_end);
+            drop(kernel);
+            assert_eq!(handle.join().unwrap(), RelayEnd::KernelClosed);
+        }
+
+        #[test]
+        fn daemon_shutdown_ends_the_relay() {
+            let (uhid, _kernel, helper_end, daemon_end) = relay_fixture();
+            let handle = spawn_relay(uhid, helper_end);
+            // SAFETY: shutdown on a socket we own.
+            assert_eq!(
+                unsafe { libc::shutdown(daemon_end.as_raw_fd(), libc::SHUT_RDWR) },
+                0
+            );
+            assert_eq!(handle.join().unwrap(), RelayEnd::DaemonClosed);
+        }
+
         fn tempfile() -> File {
             let path = std::env::temp_dir().join(format!(
                 "pocketkey-uhid-helper-test-{}-{:?}",
@@ -724,11 +992,7 @@ mod tests {
             let file = File::from(owned);
             // SAFETY: this AsyncFd exclusively owns the open descriptor.
             let fd = unsafe { AsyncFd::register(file).unwrap() };
-            let mut device = UhidDevice {
-                fd,
-                // It is a test socket, not a real device to destroy on drop.
-                destroyed: true,
-            };
+            let mut device = UhidDevice { fd };
 
             let mut event = [0u8; UHID_EVENT_SIZE];
             event[..4].copy_from_slice(&event_type.to_le_bytes());

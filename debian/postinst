@@ -1,6 +1,20 @@
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
+    # The helper socket is 0660 root:pocketkey; create the group before the
+    # debhelper snippet below starts the socket.
+    systemd-sysusers /usr/lib/sysusers.d/pocketkey.conf
+    # When installed interactively (`sudo apt install`, `sudo dpkg -i`), add the
+    # invoking user to the group, as `make install` does. Unattended installs
+    # (no SUDO_USER, or root itself) leave membership to the administrator.
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != root ] \
+        && id "$SUDO_USER" >/dev/null 2>&1 \
+        && ! id -nG "$SUDO_USER" | tr ' ' '\n' | grep -qx pocketkey; then
+        if usermod -aG pocketkey "$SUDO_USER"; then
+            echo "pocketkey: added $SUDO_USER to the pocketkey group." >&2
+            echo "pocketkey: log out and back in before the user service can start." >&2
+        fi
+    fi
     # Versions before 0.2 granted the whole desktop session access to
     # /dev/uhid through a udev rule. The privileged helper replaces that.
     rm -f /etc/udev/rules.d/60-pocketkey.rules /etc/udev/rules.d/99-pocketkey.rules
